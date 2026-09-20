@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+{% block title %}Goals — Budgetly{% endblock %}
+
+{% block content %}
+<div class="goals-hero">
+    <div>
+        <p class="eyebrow">Plan with purpose</p>
+        <h1 class="page-title">Financial Goals</h1>
+        <p class="page-subtitle">Turn big plans into visible progress, one contribution at a time.</p>
+    </div>
+    <div class="goal-hero-mark">◎</div>
+</div>
+
+<div class="summary goal-summary">
+    <div class="card savings">
+        <span class="label">Saved so far</span>
+        <span class="value">{{ currency_symbol }}{{ "{:,.0f}".format(total_saved) }}</span>
+    </div>
+    <div class="card">
+        <span class="label">Total target</span>
+        <span class="value">{{ currency_symbol }}{{ "{:,.0f}".format(total_target) }}</span>
+    </div>
+    <div class="card income">
+        <span class="label">Overall progress</span>
+        <span class="value">{{ "%.0f"|format(overall_progress) }}%</span>
+    </div>
+    <div class="card">
+        <span class="label">Completed goals</span>
+        <span class="value">{{ completed_count }}</span>
+    </div>
+</div>
+
+<section class="panel goal-form-panel">
+    <div class="panel-heading-row">
+        <div>
+    <h2>Create a goal</h2>
+            <p class="panel-description">Give your next milestone a number and a timeline.</p>
+        </div>
+    </div>
+    <form action="{{ url_for('add_goal') }}" method="POST" class="tx-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <div class="form-row">
+            <label>
+                Goal name
+                <input type="text" name="name" placeholder="e.g. Emergency Fund" required maxlength="80">
+            </label>
+            <label>
+                Target amount
+                <input type="number" name="target" step="0.01" min="0.01" required>
+            </label>
+        </div>
+        <div class="form-row">
+            <label>
+                Target date <span class="optional-label">Optional</span>
+                <input type="date" name="target_date" min="{{ today }}">
+            </label>
+            <label>
+                Planned monthly contribution <span class="optional-label">Optional</span>
+                <input type="number" name="monthly_contribution" step="0.01" min="0" placeholder="0.00">
+            </label>
+        </div>
+        <button type="submit">Add goal</button>
+    </form>
+</section>
+
+<section class="goals-grid">
+    {% for g in goals %}
+    <div class="goal-card goal-{{ g.status }}">
+        <div class="goal-header">
+            <div>
+                <span class="goal-status">{{ 'Completed' if g.status == 'completed' else 'Overdue' if g.status == 'overdue' else 'Due soon' if g.status == 'due-soon' else 'In progress' }}</span>
+                <h3>{{ g.name }}</h3>
+            </div>
+            <form action="{{ url_for('delete_goal', goal_id=g.id) }}" method="POST" class="inline-form" onsubmit="return confirm('Delete this goal?')">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <button type="submit" class="goal-delete" title="Delete">×</button>
+            </form>
+        </div>
+        <div class="goal-progress-meta">
+            <strong>{{ "%.0f"|format(g.progress) }}%</strong>
+            <span>{{ currency_symbol }}{{ "{:,.0f}".format(g.remaining) }} remaining</span>
+        </div>
+        <div class="progress-bar-wrap" aria-label="{{ '%.0f'|format(g.progress) }} percent complete">
+            <div class="progress-bar" data-percent="{{ g.progress }}"></div>
+        </div>
+        <p class="goal-numbers">{{ currency_symbol }}{{ "{:,.0f}".format(g.saved) }} saved of {{ currency_symbol }}{{ "{:,.0f}".format(g.target) }}</p>
+        <div class="goal-details">
+            {% if g.target_date %}
+            <span>Target date <strong>{{ g.target_date }}</strong></span>
+            {% if g.days_left is not none %}
+            <span class="{{ 'neg' if g.days_left < 0 else '' }}">{{ 'Past due' if g.days_left < 0 else g.days_left ~ ' days left' }}</span>
+            {% endif %}
+            {% else %}
+            <span>No target date set</span>
+            {% endif %}
+            {% if g.monthly_needed %}
+            <span>Needed monthly <strong>{{ currency_symbol }}{{ "{:,.0f}".format(g.monthly_needed) }}</strong></span>
+            {% elif g.monthly_contribution %}
+            <span>Planned monthly <strong>{{ currency_symbol }}{{ "{:,.0f}".format(g.monthly_contribution) }}</strong></span>
+            {% endif %}
+        </div>
+        <form action="{{ url_for('update_goal', goal_id=g.id) }}" method="POST" class="goal-update-form">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <label>Update saved amount
+                <input type="number" name="saved" step="0.01" min="0" max="{{ g.target }}" value="{{ g.saved }}">
+            </label>
+            <button type="submit">Save progress</button>
+        </form>
+    </div>
+    {% else %}
+    <div class="empty-state">
+        <div class="empty-state-icon">◎</div>
+        <h2>Your goals start here</h2>
+        <p>Set a target and date above to turn an idea into a plan you can track.</p>
+    </div>
+    {% endfor %}
+</section>
+
+<script>
+document.querySelectorAll('.progress-bar[data-percent]').forEach(bar => {
+    bar.style.width = Math.max(0, Math.min(100, Number(bar.dataset.percent) || 0)) + '%';
+});
+</script>
+{% endblock %}

@@ -1,0 +1,172 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — Budgetly{% endblock %}
+
+{% block content %}
+<h1 class="page-title">Dashboard</h1>
+<p class="page-subtitle">{{ this_month }} · Your monthly financial snapshot</p>
+
+<div class="balance-hero">
+    <span class="label">Remaining This Month</span>
+    <span class="value {{ 'positive' if remaining >= 0 else 'negative' }}">{{ currency_symbol }}{{ "{:,.0f}".format(remaining) }}</span>
+</div>
+
+<div class="summary">
+    <div class="card income">
+        <span class="label">Income</span>
+        <span class="value">{{ currency_symbol }}{{ "{:,.0f}".format(income) }}</span>
+    </div>
+    <div class="card expense">
+        <span class="label">Expenses</span>
+        <span class="value">{{ currency_symbol }}{{ "{:,.0f}".format(expenses) }}</span>
+    </div>
+    <div class="card savings">
+        <span class="label">Savings</span>
+        <span class="value">{{ currency_symbol }}{{ "{:,.0f}".format(savings) }}</span>
+    </div>
+    <div class="card insight">
+        <span class="label">Biggest category</span>
+        <span class="value">{{ biggest_category or "—" }}</span>
+    </div>
+</div>
+
+<div class="rates">
+    <div class="rate-item">
+        <span class="dot green"></span> Savings rate: <strong>{{ "%.1f"|format(savings_rate) }}%</strong>
+    </div>
+    <div class="rate-item">
+        <span class="dot red"></span> Expense rate: <strong>{{ "%.1f"|format(expense_rate) }}%</strong>
+    </div>
+    <div class="rate-item">
+        <span class="dot gray"></span> Remaining: <strong>{{ "%.1f"|format(remaining_rate) }}%</strong>
+    </div>
+</div>
+
+<div class="dashboard-grid">
+    <section class="panel">
+        <h2>Cash flow over time</h2>
+        {% if trend_labels %}
+        <div class="chart-wrap dashboard-chart"><canvas id="cashFlowChart"></canvas></div>
+        {% else %}
+        <p class="empty">Add transactions to see your trend.</p>
+        {% endif %}
+    </section>
+
+    <section class="panel">
+        <h2>Spending by category</h2>
+        {% if category_totals %}
+        <div class="chart-wrap dashboard-chart"><canvas id="categoryChart"></canvas></div>
+        {% if biggest_category %}
+        <p class="hint">Biggest category: <strong>{{ biggest_category }}</strong></p>
+        {% endif %}
+        {% else %}
+        <p class="empty">No spending logged yet this month.</p>
+        {% endif %}
+    </section>
+
+</div>
+
+<div class="dashboard-grid">
+    <section class="panel">
+        <div class="panel-heading-row">
+            <div>
+                <h2>Budget progress</h2>
+                <p class="panel-description">This month's spending against your limits.</p>
+            </div>
+            <a class="panel-link" href="{{ url_for('budget') }}">Manage budgets</a>
+        </div>
+        {% if budget_progress %}
+        <div class="dashboard-budget-list">
+            {% for budget in budget_progress[:5] %}
+            <div class="dashboard-budget-row">
+                <div class="dashboard-budget-heading">
+                    <strong>{{ budget.category }}</strong>
+                    <span class="{{ 'neg' if budget.status == 'over' else '' }}">{{ budget.percentage }}%</span>
+                </div>
+                <div class="dashboard-budget-bar"><span class="{{ budget.status }}" style="width: {{ budget.progress }}%"></span></div>
+                <div class="dashboard-budget-foot">
+                    <span>{{ currency_symbol }}{{ "{:,.0f}".format(budget.actual) }} spent</span>
+                    <span>of {{ currency_symbol }}{{ "{:,.0f}".format(budget.budget) }}</span>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+        {% else %}
+        <p class="empty">No budgets set yet. <a href="{{ url_for('budget') }}">Create one</a> to track your limits.</p>
+        {% endif %}
+    </section>
+
+    <section class="panel">
+        <div class="panel-heading-row">
+            <h2>Recent transactions</h2>
+            <a class="panel-link" href="{{ url_for('transactions') }}">View all</a>
+        </div>
+        {% if recent %}
+        <ul class="recent-list">
+            {% for t in recent %}
+            <li>
+                <span class="cat">{{ t.category }}</span>
+                <span class="desc">{{ t.description or "—" }}</span>
+                <span class="amt {{ 'pos' if t.group_name == 'income' else 'neg' }}">
+                    {{ '+' if t.group_name == 'income' else '-' }}{{ currency_symbol }}{{ "{:,.0f}".format(t.amount) }}
+                </span>
+            </li>
+            {% endfor %}
+        </ul>
+        {% else %}
+        <p class="empty">No transactions yet. <a href="{{ url_for('transactions') }}">Add one</a>.</p>
+        {% endif %}
+    </section>
+</div>
+
+<script type="application/json" id="dashboardTrendData">
+{{ {"labels": trend_labels, "income": trend_income, "expense": trend_expense, "net": trend_net} | tojson }}
+</script>
+<script>
+const dashboardTrendData = JSON.parse(document.getElementById('dashboardTrendData').textContent);
+const cashFlowCanvas = document.getElementById('cashFlowChart');
+if (cashFlowCanvas) {
+    new Chart(cashFlowCanvas, {
+        type: 'bar',
+        data: {
+            labels: dashboardTrendData.labels,
+            datasets: [
+                { label: 'Income', data: dashboardTrendData.income, backgroundColor: '#10b981' },
+                { label: 'Expenses', data: dashboardTrendData.expense, backgroundColor: '#ef4444' },
+                { label: 'Net', data: dashboardTrendData.net, type: 'line', borderColor: '#6366f1', backgroundColor: '#6366f1', tension: 0.25 }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { position: 'bottom' } },
+            scales: { y: { beginAtZero: true } }
+        }
+    });
+}
+</script>
+
+{% if category_totals %}
+<script type="application/json" id="categoryData">
+    {{ {"labels": category_totals.keys() | list, "values": category_totals.values() | list} | tojson }}
+</script>
+<script>
+const categoryData = JSON.parse(document.getElementById('categoryData').textContent);
+const ctx = document.getElementById('categoryChart');
+new Chart(ctx, {
+    type: 'doughnut',
+    data: {
+        labels: categoryData.labels,
+        datasets: [{
+            data: categoryData.values,
+            backgroundColor: ['#6366f1', '#ec4899', '#f59e0b', '#10b981', '#3b82f6', '#ef4444', '#8b5cf6', '#14b8a6']
+        }]
+    },
+    options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { position: 'bottom' } }
+    }
+});
+</script>
+{% endif %}
+{% endblock %}

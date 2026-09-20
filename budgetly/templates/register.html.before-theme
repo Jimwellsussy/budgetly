@@ -1,0 +1,125 @@
+{% extends "base.html" %}
+{% block title %}Sign Up — Budgetly{% endblock %}
+
+{% block auth_content %}
+<div class="auth-wrap">
+    <div class="auth-card">
+        <h1> Budgetly</h1>
+        <p class="subtitle">Create your account</p>
+
+        {% with messages = get_flashed_messages() %}
+          {% if messages %}
+            <div class="alert alert-error">
+                <ul class="alert-list">
+                    {% for message in messages %}
+                        <li>{{ message }}</li>
+                    {% endfor %}
+                </ul>
+            </div>
+          {% endif %}
+        {% endwith %}
+
+        <form method="POST" class="auth-form" id="register-form" novalidate>
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <label>
+                Username
+                <input type="text" name="username" id="username" required autofocus>
+            </label>
+            <label>
+                Email
+                <input type="email" name="email" id="email" required>
+            </label>
+            <label>
+                Password
+                <input type="password" name="password" id="password" required>
+            </label>
+            <label>
+                Confirm Password
+                <input type="password" name="confirm_password" id="confirm_password" required>
+            </label>
+
+            <ul class="pw-requirements hidden" id="pw-requirements">
+                <li data-rule="length">At least 8 characters</li>
+                <li data-rule="upper">At least 1 uppercase letter</li>
+                <li data-rule="lower">At least 1 lowercase letter</li>
+                <li data-rule="number">At least 1 number</li>
+                <li data-rule="special">At least 1 special character (! @ # $ % ^ &amp; *)</li>
+                <li data-rule="nospace">No spaces</li>
+                <li data-rule="nousername">Doesn't contain your username</li>
+                <li data-rule="match">Passwords match</li>
+            </ul>
+
+            <button type="submit">Sign Up</button>
+        </form>
+        <p class="auth-switch">Already have an account? <a href="{{ url_for('login') }}">Log in</a></p>
+    </div>
+</div>
+
+<script>
+(function () {
+    const usernameInput = document.getElementById('username');
+    const passwordInput = document.getElementById('password');
+    const confirmInput = document.getElementById('confirm_password');
+    const form = document.getElementById('register-form');
+    const requirementsList = document.getElementById('pw-requirements');
+    const specialChars = "!@#$%^&*";
+
+    function checkRules() {
+        const username = usernameInput.value.trim().toLowerCase();
+        const password = passwordInput.value;
+        const confirm = confirmInput.value;
+
+        const results = {
+            length: password.length >= 8,
+            upper: /[A-Z]/.test(password),
+            lower: /[a-z]/.test(password),
+            number: /[0-9]/.test(password),
+            special: [...password].some(ch => specialChars.includes(ch)),
+            nospace: password.length > 0 && !password.includes(' '),
+            nousername: password.length > 0 && (!username || !password.toLowerCase().includes(username)),
+            match: password.length > 0 && password === confirm,
+        };
+
+        Object.entries(results).forEach(([rule, passed]) => {
+            const item = document.querySelector(`[data-rule="${rule}"]`);
+            if (!item) return;
+            item.classList.toggle('valid', passed);
+            item.classList.toggle('invalid', !passed);
+        });
+
+        return Object.values(results).every(Boolean);
+    }
+
+    function showRequirements() {
+        if (passwordInput.value.length > 0) {
+            checkRules();
+            requirementsList.classList.remove('hidden');
+        }
+    }
+
+    // Checklist stays hidden while actively typing. It only reveals once
+    // the user leaves the password or confirm-password field (i.e. they've
+    // finished entering it), so it doesn't feel like it's nagging mid-type.
+    passwordInput.addEventListener('blur', showRequirements);
+    confirmInput.addEventListener('blur', showRequirements);
+
+    // Once visible, keep the checkmarks live as they make corrections.
+    [passwordInput, confirmInput, usernameInput].forEach(el => {
+        el.addEventListener('input', function () {
+            if (!requirementsList.classList.contains('hidden')) {
+                checkRules();
+            }
+        });
+    });
+
+    // This is a UX helper only — the server re-validates everything,
+    // since client-side checks can always be bypassed.
+    form.addEventListener('submit', function (e) {
+        if (!checkRules()) {
+            requirementsList.classList.remove('hidden');
+            e.preventDefault();
+        }
+    });
+})();
+</script>
+{% endblock %}

@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+{% block title %}Budget — Budgetly{% endblock %}
+
+{% block content %}
+<h1 class="page-title">Budget vs Actual</h1>
+<p class="page-subtitle">{{ this_month }} · Alerts at {{ alert_threshold }}% of each budget</p>
+
+<form action="{{ url_for('budget') }}" method="GET" class="month-picker">
+    <label>View month
+        <input type="month" name="month" value="{{ this_month }}">
+    </label>
+    <button type="submit">View</button>
+</form>
+
+<div class="summary budget-summary">
+    <div class="card">
+        <span class="label">Total budget</span>
+        <span class="value">{{ currency_symbol }}{{ "{:,.0f}".format(total_budget) }}</span>
+    </div>
+    <div class="card expense">
+        <span class="label">Total spent</span>
+        <span class="value">{{ currency_symbol }}{{ "{:,.0f}".format(total_actual) }}</span>
+    </div>
+    <div class="card {{ 'income' if total_difference >= 0 else 'expense' }}">
+        <span class="label">Remaining</span>
+        <span class="value">{{ '-' if total_difference < 0 else '' }}{{ currency_symbol }}{{ "{:,.0f}".format(total_difference | abs) }}</span>
+    </div>
+</div>
+
+<section class="panel">
+    <h2>Set a Budget</h2>
+    <form action="{{ url_for('budget') }}" method="POST" class="tx-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <input type="hidden" name="month" value="{{ this_month }}">
+        <div class="form-row">
+            <label>
+                Category
+                <select name="category" required>
+                    {% for cat in all_expense_categories %}
+                    <option value="{{ cat }}">{{ cat }}{{ ' (already set)' if cat in already_budgeted }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <label>
+                Monthly Budget Amount
+                <input type="number" name="budget_amount" step="0.01" min="0.01" required>
+            </label>
+        </div>
+        <button type="submit">Save Budget</button>
+    </form>
+</section>
+
+<section class="panel">
+    <h2>This Month's Comparison</h2>
+    {% if comparison %}
+    <div class="table-scroll">
+    <table class="tx-table">
+        <thead>
+            <tr>
+                <th>Category</th>
+                <th>Budget</th>
+                <th>Actual</th>
+                <th>Difference</th>
+                <th>Status</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for row in comparison %}
+            <tr>
+                <td>{{ row.category }}</td>
+                <td>{{ currency_symbol }}{{ "{:,.0f}".format(row.budget) }}</td>
+                <td>{{ currency_symbol }}{{ "{:,.0f}".format(row.actual) }}</td>
+                <td class="{{ 'pos' if row.difference >= 0 else 'neg' }}">
+                    {{ '+' if row.difference >= 0 else '' }}{{ currency_symbol }}{{ "{:,.0f}".format(row.difference) }}
+                </td>
+                <td>
+                    <div class="budget-status {{ row.status }}">
+                        <span class="budget-progress"><span style="width: {{ row.progress }}%"></span></span>
+                        <small>{{ 'Over budget' if row.status == 'over' else 'Near limit' if row.status == 'warning' else 'On track' }}</small>
+                    </div>
+                </td>
+                <td>
+                    <form action="{{ url_for('delete_budget', category=row.category, month=this_month) }}" method="POST" class="inline-form" onsubmit="return confirm('Remove this budget?')">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <button type="submit" class="text-danger">Remove</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    </div>
+    {% else %}
+    <p class="empty">No budgets set yet — add one above to start comparing.</p>
+    {% endif %}
+</section>
+{% endblock %}

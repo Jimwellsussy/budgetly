@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+{% block title %}Edit Transaction — Budgetly{% endblock %}
+
+{% block content %}
+<div class="transaction-header">
+    <div>
+        <h1 class="page-title">Edit transaction</h1>
+        <p class="page-subtitle">Update the details and keep your reports accurate.</p>
+    </div>
+    <a class="button-secondary" href="{{ url_for('transactions') }}">Cancel</a>
+</div>
+
+<section class="panel edit-transaction-panel">
+    <form action="{{ url_for('edit_transaction', transaction_id=transaction.id) }}" method="POST" class="tx-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <div class="form-row">
+            <label>
+                Group
+                <select name="group_name" id="edit_group_name" required>
+                    {% for key, label in group_labels.items() %}
+                    <option value="{{ key }}" {{ 'selected' if transaction.group_name == key }}>{{ label }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <label>
+                Category
+                <select name="category" id="edit_category" required></select>
+            </label>
+        </div>
+        <div class="form-row">
+            <label>
+                Amount
+                <input type="number" name="amount" step="0.01" min="0.01" value="{{ transaction.amount }}" required>
+            </label>
+            <label>
+                Date
+                <input type="date" name="date" value="{{ transaction.date }}" required>
+            </label>
+        </div>
+        <div class="form-row">
+            <label>
+                <span id="editPaymentLabel">Payment method</span>
+                <select name="payment_method" id="edit_payment_method"></select>
+            </label>
+            <label>
+                Description
+                <input type="text" name="description" value="{{ transaction.description or '' }}" maxlength="200">
+            </label>
+        </div>
+        <button type="submit">Save changes</button>
+    </form>
+</section>
+
+<script type="application/json" id="editCategories">{{ category_groups | tojson }}</script>
+<script type="application/json" id="editPaymentMethods">{{ {"expense": payment_methods, "income": income_payment_methods} | tojson }}</script>
+<script>
+const editCategories = JSON.parse(document.getElementById('editCategories').textContent);
+const editPaymentMethods = JSON.parse(document.getElementById('editPaymentMethods').textContent);
+const editGroup = document.getElementById('edit_group_name');
+const editCategory = document.getElementById('edit_category');
+const editPayment = document.getElementById('edit_payment_method');
+const existingCategory = {{ transaction.category | tojson }};
+const existingPayment = {{ (transaction.payment_method or '') | tojson }};
+
+function updateEditFields() {
+    const group = editGroup.value;
+    editCategory.innerHTML = '';
+    (editCategories[group] || []).forEach(category => {
+        const option = document.createElement('option');
+        option.value = category;
+        option.textContent = category;
+        option.selected = category === existingCategory;
+        editCategory.appendChild(option);
+    });
+    const methods = group === 'income' ? editPaymentMethods.income : editPaymentMethods.expense;
+    editPayment.innerHTML = '';
+    document.getElementById('editPaymentLabel').textContent = group === 'income' ? 'Money received via' : 'Payment method';
+    methods.forEach(method => {
+        const option = document.createElement('option');
+        option.value = method;
+        option.textContent = method;
+        option.selected = method === existingPayment;
+        editPayment.appendChild(option);
+    });
+}
+editGroup.addEventListener('change', updateEditFields);
+updateEditFields();
+</script>
+{% endblock %}

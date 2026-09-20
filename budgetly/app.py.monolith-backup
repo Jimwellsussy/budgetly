@@ -1,0 +1,1335 @@
+from flask import Flask, render_template, request, redirect, url_for, flash, Response
+from flask_login import (
+    LoginManager, UserMixin, login_user, logout_user,
+    login_required, current_user
+)
+from werkzeug.security import generate_password_hash, check_password_hash
+from flask_mail import Mail, Message
+from flask_wtf import CSRFProtect
+from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadSignature
+import csv
+import io
+import json
+import os
+import re
+import sqlite3
+from datetime import date, datetime
+
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("BUDGETLY_SECRET_KEY", "dev-secret-key-change-this-later")
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("BUDGETLY_COOKIE_SECURE", "0") == "1",
+    MAX_CONTENT_LENGTH=2 * 1024 * 1024,
+)
+csrf = CSRFProtect(app)
+DB_PATH = os.path.join(os.path.dirname(__file__), "budgetly.db")
+
+app.config["MAIL_SERVER"] = os.environ.get("MAIL_SERVER", "smtp.gmail.com")
+app.config["MAIL_PORT"] = int(os.environ.get("MAIL_PORT", 587))
+app.config["MAIL_USE_TLS"] = os.environ.get("MAIL_USE_TLS", "true").lower() == "true"
+app.config["MAIL_USERNAME"] = os.environ.get("MAIL_USERNAME")
+app.config["MAIL_PASSWORD"] = os.environ.get("MAIL_PASSWORD")
+app.config["MAIL_DEFAULT_SENDER"] = os.environ.get("MAIL_USERNAME")
+mail = Mail(app)
+
+reset_serializer = URLSafeTimedSerializer(app.secret_key)
+RESET_SALT = "password-reset-salt"
+RESET_TOKEN_MAX_AGE = 3600
+
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = "login"
+
+
+CATEGORY_GROUPS = {
+    "income": ["Salary", "Freelance/Side Hustle", "Allowance", "Other Income"],
+    "fixed_expense": ["Rent", "Internet", "Phone", "Insurance", "Subscriptions", "Loans/Debt"],
+    "variable_expense": ["Food", "Transportation", "Groceries", "Entertainment", "Shopping", "Hobbies", "Miscellaneous"],
+    "savings": ["Emergency Fund", "General Savings", "Big Purchases", "Investments", "Vacation/Travel"],
+}
+GROUP_LABELS = {
+    "income": "Income",
+    "fixed_expense": "Fixed Expense",
+    "variable_expense": "Variable Expense",
+    "savings": "Savings",
+}
+PAYMENT_METHODS = ["Cash", "Debit Card", "Credit Card", "Bank Transfer", "GCash/E-wallet"]
+INCOME_PAYMENT_METHODS = [
+    "Cash received",
+    "Bank transfer received",
+    "Digital wallet received",
+    "Other income",
+]
+CURRENCY_SYMBOLS = {"PHP": "₱", "USD": "$", "EUR": "€", "GBP": "£", "JPY": "¥", "AUD": "A$"}
+SETTINGS_DEFAULTS = {
+    "currency": "PHP",
+    "week_start": "monday",
+    "default_group": "variable_expense",
+    "default_category": "Food",
+    "default_payment_method": "Cash",
+    "budget_alert_threshold": 80,
+    "compact_mode": 0,
+    "budget_alerts": 1,
+    "weekly_summary": 0,
+    "goal_reminders": 0,
+}
+
+SPECIAL_CHARS = ".!@#$%^&*"
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+LOGIN_ATTEMPTS = {}
+
+
+def validate_password(password, username=None):
+    errors = []
+    if len(password) < 8:
+        errors.append("Password must be at least 8 characters long.")
+    if not re.search(r"[A-Z]", password):
+        errors.append("Password must contain at least 1 uppercase letter.")
+    if not re.search(r"[a-z]", password):
+        errors.append("Password must contain at least 1 lowercase letter.")
+    if not re.search(r"[0-9]", password):
+        errors.append("Password must contain at least 1 number.")
+    if not any(ch in SPECIAL_CHARS for ch in password):
+        errors.append(f"Password must contain at least 1 special character ({' '.join(SPECIAL_CHARS)}).")
+    if " " in password:
+        errors.append("Password cannot contain spaces.")
+    if username and username.strip().lower() in password.lower():
+        errors.append("Password cannot contain your username.")
+    return errors
+
+
+def is_password_previously_used(conn, user_id, password):
+    rows = conn.execute(
+        "SELECT password_hash FROM password_history WHERE user_id = ?", (user_id,)
+    ).fetchall()
+    return any(check_password_hash(row["password_hash"], password) for row in rows)
+
+
+def record_password(conn, user_id, password_hash):
+    conn.execute(
+        "INSERT INTO password_history (user_id, password_hash, created_at) VALUES (?, ?, ?)",
+        (user_id, password_hash, datetime.utcnow().isoformat()),
+    )
+
+
+def generate_reset_token(email, current_password_hash):
+    return reset_serializer.dumps(
+        {"email": email, "hash": current_password_hash}, salt=RESET_SALT
+    )
+
+
+def verify_reset_token(token, max_age=RESET_TOKEN_MAX_AGE):
+    data = reset_serializer.loads(token, salt=RESET_SALT, max_age=max_age)
+    return data["email"], data["hash"]
+
+
+def send_reset_email(to_email, reset_url):
+    msg = Message("Reset your Budgetly password", recipients=[to_email])
+    msg.body = (
+        "We received a request to reset your Budgetly password.\n\n"
+        f"Click the link below to choose a new one (expires in 1 hour):\n{reset_url}\n\n"
+        "If you did not request this, you can safely ignore this email."
+    )
+    mail.send(msg)
+
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def ensure_user_settings_table(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_settings (
+            user_id INTEGER PRIMARY KEY,
+            currency TEXT NOT NULL DEFAULT 'PHP',
+            week_start TEXT NOT NULL DEFAULT 'monday',
+            default_group TEXT NOT NULL DEFAULT 'variable_expense',
+            default_category TEXT NOT NULL DEFAULT 'Food',
+            default_payment_method TEXT NOT NULL DEFAULT 'Cash',
+            budget_alert_threshold INTEGER NOT NULL DEFAULT 80,
+            compact_mode INTEGER NOT NULL DEFAULT 0,
+            budget_alerts INTEGER NOT NULL DEFAULT 1,
+            weekly_summary INTEGER NOT NULL DEFAULT 0,
+            goal_reminders INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL DEFAULT '',
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+    """)
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(user_settings)")}
+    additions = {
+        "currency": "TEXT NOT NULL DEFAULT 'PHP'",
+        "week_start": "TEXT NOT NULL DEFAULT 'monday'",
+        "default_group": "TEXT NOT NULL DEFAULT 'variable_expense'",
+        "default_category": "TEXT NOT NULL DEFAULT 'Food'",
+        "default_payment_method": "TEXT NOT NULL DEFAULT 'Cash'",
+        "budget_alert_threshold": "INTEGER NOT NULL DEFAULT 80",
+        "compact_mode": "INTEGER NOT NULL DEFAULT 0",
+        "budget_alerts": "INTEGER NOT NULL DEFAULT 1",
+        "weekly_summary": "INTEGER NOT NULL DEFAULT 0",
+        "goal_reminders": "INTEGER NOT NULL DEFAULT 0",
+        "updated_at": "TEXT NOT NULL DEFAULT ''",
+    }
+    for name, definition in additions.items():
+        if name not in columns:
+            conn.execute(f"ALTER TABLE user_settings ADD COLUMN {name} {definition}")
+
+
+def ensure_recurring_table(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS recurring_transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            group_name TEXT NOT NULL,
+            category TEXT NOT NULL,
+            description TEXT,
+            amount REAL NOT NULL,
+            payment_method TEXT,
+            day_of_month INTEGER NOT NULL DEFAULT 1,
+            last_processed_month TEXT,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+    """)
+
+
+def init_db():
+    conn = get_db()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS password_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            group_name TEXT NOT NULL,
+            category TEXT NOT NULL,
+            description TEXT,
+            amount REAL NOT NULL,
+            payment_method TEXT,
+            date TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS goals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            target REAL NOT NULL,
+            saved REAL NOT NULL DEFAULT 0,
+            target_date TEXT,
+            monthly_contribution REAL NOT NULL DEFAULT 0,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS budgets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            category TEXT NOT NULL,
+            month TEXT NOT NULL,
+            budget_amount REAL NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            UNIQUE(user_id, category, month)
+        )
+    """)
+    ensure_user_settings_table(conn)
+    ensure_recurring_table(conn)
+    conn.commit()
+    conn.close()
+
+
+def migrate_db():
+    conn = get_db()
+    user_columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
+    if "email" not in user_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN email TEXT")
+
+    goal_columns = {row["name"] for row in conn.execute("PRAGMA table_info(goals)")}
+    if "target_date" not in goal_columns:
+        conn.execute("ALTER TABLE goals ADD COLUMN target_date TEXT")
+    if "monthly_contribution" not in goal_columns:
+        conn.execute("ALTER TABLE goals ADD COLUMN monthly_contribution REAL NOT NULL DEFAULT 0")
+
+    ensure_user_settings_table(conn)
+    ensure_recurring_table(conn)
+    for user in conn.execute("SELECT id FROM users").fetchall():
+        conn.execute(
+            "INSERT OR IGNORE INTO user_settings (user_id, updated_at) VALUES (?, ?)",
+            (user["id"], datetime.utcnow().isoformat()),
+        )
+
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_transactions_user_date ON transactions(user_id, date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_transactions_user_group ON transactions(user_id, group_name)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_budgets_user_month ON budgets(user_id, month)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_goals_user ON goals(user_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_recurring_user_active ON recurring_transactions(user_id, active)")
+    conn.commit()
+    conn.close()
+
+
+class User(UserMixin):
+    def __init__(self, id, username, email=None):
+        self.id = id
+        self.username = username
+        self.email = email
+
+
+@login_manager.user_loader
+def load_user(user_id):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    conn.close()
+    if row:
+        return User(row["id"], row["username"], row["email"])
+    return None
+
+
+def get_user_settings(user_id):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM user_settings WHERE user_id = ?", (user_id,)).fetchone()
+    if row is None:
+        conn.execute(
+            "INSERT OR IGNORE INTO user_settings (user_id, updated_at) VALUES (?, ?)",
+            (user_id, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM user_settings WHERE user_id = ?", (user_id,)).fetchone()
+    conn.close()
+    settings = dict(SETTINGS_DEFAULTS)
+    if row:
+        settings.update(dict(row))
+    return settings
+
+
+def save_user_settings(user_id, values):
+    settings = dict(SETTINGS_DEFAULTS)
+    settings.update(get_user_settings(user_id))
+    settings.update(values)
+    conn = get_db()
+    conn.execute("""
+        INSERT INTO user_settings (
+            user_id, currency, week_start, default_group, default_category,
+            default_payment_method, budget_alert_threshold, compact_mode,
+            budget_alerts, weekly_summary, goal_reminders, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            currency = excluded.currency,
+            week_start = excluded.week_start,
+            default_group = excluded.default_group,
+            default_category = excluded.default_category,
+            default_payment_method = excluded.default_payment_method,
+            budget_alert_threshold = excluded.budget_alert_threshold,
+            compact_mode = excluded.compact_mode,
+            budget_alerts = excluded.budget_alerts,
+            weekly_summary = excluded.weekly_summary,
+            goal_reminders = excluded.goal_reminders,
+            updated_at = excluded.updated_at
+    """, (
+        user_id, settings["currency"], settings["week_start"],
+        settings["default_group"], settings["default_category"],
+        settings["default_payment_method"], settings["budget_alert_threshold"],
+        int(bool(settings["compact_mode"])), int(bool(settings["budget_alerts"])),
+        int(bool(settings["weekly_summary"])), int(bool(settings["goal_reminders"])),
+        datetime.utcnow().isoformat(),
+    ))
+    conn.commit()
+    conn.close()
+
+
+@app.context_processor
+def inject_user_preferences():
+    if not current_user.is_authenticated:
+        return {"currency_symbol": CURRENCY_SYMBOLS["PHP"], "compact_mode": False}
+    settings = get_user_settings(current_user.id)
+    return {
+        "currency_symbol": CURRENCY_SYMBOLS.get(settings["currency"], "₱"),
+        "compact_mode": bool(settings["compact_mode"]),
+    }
+
+
+def login_key():
+    return f"{request.remote_addr}:{request.form.get('username', '').strip().lower()}"
+
+
+def login_is_limited():
+    item = LOGIN_ATTEMPTS.get(login_key())
+    if not item:
+        return False
+    return item["count"] >= 5 and (datetime.utcnow() - item["first"]).total_seconds() < 900
+
+
+def record_login_failure():
+    key = login_key()
+    now = datetime.utcnow()
+    item = LOGIN_ATTEMPTS.get(key)
+    if not item or (now - item["first"]).total_seconds() >= 900:
+        LOGIN_ATTEMPTS[key] = {"count": 1, "first": now}
+    else:
+        item["count"] += 1
+
+
+def clear_login_failures():
+    LOGIN_ATTEMPTS.pop(login_key(), None)
+
+
+def parse_amount(value):
+    try:
+        amount = float(value)
+        return amount if amount > 0 else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def valid_month(value):
+    return bool(value and re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", value))
+
+
+def valid_transaction(group_name, category, payment_method=None):
+    if group_name not in CATEGORY_GROUPS or category not in CATEGORY_GROUPS[group_name]:
+        return False
+    allowed = INCOME_PAYMENT_METHODS if group_name == "income" else PAYMENT_METHODS
+    return not payment_method or payment_method in allowed
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+        if not username or not email or not password:
+            flash("Please fill in all fields.")
+            return redirect(url_for("register"))
+        if not EMAIL_PATTERN.match(email):
+            flash("Please enter a valid email address.")
+            return redirect(url_for("register"))
+        errors = validate_password(password, username)
+        if errors:
+            for error in errors:
+                flash(error)
+            return redirect(url_for("register"))
+
+        conn = get_db()
+        if conn.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone():
+            conn.close()
+            flash("That username is already taken.")
+            return redirect(url_for("register"))
+        if conn.execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone():
+            conn.close()
+            flash("That email is already registered.")
+            return redirect(url_for("register"))
+
+        password_hash = generate_password_hash(password)
+        cursor = conn.execute(
+            "INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)",
+            (username, email, password_hash),
+        )
+        user_id = cursor.lastrowid
+        record_password(conn, user_id, password_hash)
+        conn.execute("INSERT OR IGNORE INTO user_settings (user_id, updated_at) VALUES (?, ?)",
+                     (user_id, datetime.utcnow().isoformat()))
+        conn.commit()
+        conn.close()
+        flash("Account created! Please log in.")
+        return redirect(url_for("login"))
+    return render_template("register.html")
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        if login_is_limited():
+            flash("Too many failed attempts. Please wait 15 minutes and try again.")
+            return redirect(url_for("login"))
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        conn = get_db()
+        row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        conn.close()
+        if row and check_password_hash(row["password_hash"], password):
+            clear_login_failures()
+            login_user(User(row["id"], row["username"], row["email"]))
+            return redirect(url_for("dashboard"))
+        record_login_failure()
+        flash("Invalid username or password.")
+        return redirect(url_for("login"))
+    return render_template("login.html")
+
+
+@app.route("/logout", methods=["POST"])
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for("login"))
+
+
+@app.route("/forgot-password", methods=["GET", "POST"])
+def forgot_password():
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        conn = get_db()
+        row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+        conn.close()
+        if row and row["email"]:
+            token = generate_reset_token(row["email"], row["password_hash"])
+            reset_url = url_for("reset_password", token=token, _external=True)
+            try:
+                send_reset_email(row["email"], reset_url)
+            except Exception:
+                app.logger.exception("Failed to send password reset email")
+        flash("If that email is registered, we've sent a link to reset your password.")
+        return redirect(url_for("login"))
+    return render_template("forgot_password.html")
+
+
+@app.route("/reset-password/<token>", methods=["GET", "POST"])
+def reset_password(token):
+    try:
+        email, token_hash = verify_reset_token(token)
+    except SignatureExpired:
+        flash("That reset link has expired. Please request a new one.")
+        return redirect(url_for("forgot_password"))
+    except BadSignature:
+        flash("That reset link is invalid.")
+        return redirect(url_for("forgot_password"))
+
+    conn = get_db()
+    row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+    if not row or row["password_hash"] != token_hash:
+        conn.close()
+        flash("That reset link is invalid or has already been used.")
+        return redirect(url_for("forgot_password"))
+    if request.method == "POST":
+        new_password = request.form.get("password", "")
+        confirm_password = request.form.get("confirm_password", "")
+        if new_password != confirm_password:
+            conn.close()
+            flash("Passwords do not match.")
+            return redirect(url_for("reset_password", token=token))
+        errors = validate_password(new_password, row["username"])
+        if not errors and is_password_previously_used(conn, row["id"], new_password):
+            errors.append("You've used that password before. Please choose a different one.")
+        if errors:
+            conn.close()
+            for error in errors:
+                flash(error)
+            return redirect(url_for("reset_password", token=token))
+        new_hash = generate_password_hash(new_password)
+        conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (new_hash, row["id"]))
+        record_password(conn, row["id"], new_hash)
+        conn.commit()
+        conn.close()
+        flash("Your password has been reset. Please log in.")
+        return redirect(url_for("login"))
+    conn.close()
+    return render_template("reset_password.html", token=token, username=row["username"])
+
+
+def get_month_transactions(user_id, month):
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM transactions WHERE user_id = ? AND date LIKE ? ORDER BY date DESC, id DESC",
+        (user_id, f"{month}%"),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def summarize(transactions):
+    totals = {"income": 0, "fixed_expense": 0, "variable_expense": 0, "savings": 0}
+    category_totals = {}
+    for transaction in transactions:
+        group = transaction["group_name"]
+        if group not in totals:
+            continue
+        totals[group] += transaction["amount"]
+        if group in ("fixed_expense", "variable_expense"):
+            category_totals[transaction["category"]] = (
+                category_totals.get(transaction["category"], 0) + transaction["amount"]
+            )
+    return totals, category_totals
+
+
+def month_sequence(count):
+    today = date.today()
+    result = []
+    year, month = today.year, today.month
+    for _ in range(count):
+        result.append(f"{year:04d}-{month:02d}")
+        month -= 1
+        if month == 0:
+            month, year = 12, year - 1
+    return list(reversed(result))
+
+
+def get_report_data(user_id, months=6):
+    month_labels = month_sequence(months)
+    start_month = month_labels[0]
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM transactions WHERE user_id = ? AND date >= ? ORDER BY date ASC, id ASC",
+        (user_id, f"{start_month}-01"),
+    ).fetchall()
+    conn.close()
+    monthly = {month: {"income": 0, "expense": 0, "savings": 0, "net": 0} for month in month_labels}
+    top_categories = {}
+    current_month = date.today().strftime("%Y-%m")
+    current_category_totals = {}
+    for transaction in rows:
+        month = transaction["date"][:7]
+        if month not in monthly:
+            continue
+        amount = transaction["amount"]
+        group = transaction["group_name"]
+        if group == "income":
+            monthly[month]["income"] += amount
+        elif group in ("fixed_expense", "variable_expense"):
+            monthly[month]["expense"] += amount
+            top_categories[transaction["category"]] = top_categories.get(transaction["category"], 0) + amount
+            if month == current_month:
+                current_category_totals[transaction["category"]] = current_category_totals.get(transaction["category"], 0) + amount
+        elif group == "savings":
+            monthly[month]["savings"] += amount
+    for values in monthly.values():
+        values["net"] = values["income"] - values["expense"] - values["savings"]
+    monthly_rows = [{"month": month, **monthly[month]} for month in month_labels]
+    total_income = sum(row["income"] for row in monthly_rows)
+    total_expenses = sum(row["expense"] for row in monthly_rows)
+    total_savings = sum(row["savings"] for row in monthly_rows)
+    return {
+        "trend_labels": month_labels,
+        "trend_income": [row["income"] for row in monthly_rows],
+        "trend_expense": [row["expense"] for row in monthly_rows],
+        "trend_savings": [row["savings"] for row in monthly_rows],
+        "trend_net": [row["net"] for row in monthly_rows],
+        "monthly_rows": monthly_rows,
+        "total_income": total_income,
+        "total_expenses": total_expenses,
+        "total_savings": total_savings,
+        "total_net": total_income - total_expenses - total_savings,
+        "top_categories": sorted(top_categories.items(), key=lambda item: item[1], reverse=True),
+        "current_category_totals": current_category_totals,
+    }
+
+
+def get_budget_progress(user_id, month, threshold):
+    conn = get_db()
+    budgets = conn.execute(
+        "SELECT * FROM budgets WHERE user_id = ? AND month = ? ORDER BY category",
+        (user_id, month),
+    ).fetchall()
+    conn.close()
+    _, actual_by_category = summarize(get_month_transactions(user_id, month))
+    result = []
+    for budget in budgets:
+        actual = actual_by_category.get(budget["category"], 0)
+        amount = budget["budget_amount"]
+        percentage = (actual / amount * 100) if amount else 0
+        result.append({
+            "id": budget["id"], "category": budget["category"], "budget": amount,
+            "actual": actual, "difference": amount - actual,
+            "percentage": round(percentage, 1), "progress": min(100, max(0, percentage)),
+            "status": "over" if percentage > 100 else "warning" if percentage >= threshold else "ok",
+        })
+    return result
+
+
+def process_recurring_transactions(user_id):
+    current_month = date.today().strftime("%Y-%m")
+    today_number = date.today().day
+    conn = get_db()
+    recurring = conn.execute(
+        "SELECT * FROM recurring_transactions WHERE user_id = ? AND active = 1 AND day_of_month <= ?",
+        (user_id, today_number),
+    ).fetchall()
+    for item in recurring:
+        if item["last_processed_month"] == current_month:
+            continue
+        transaction_date = f"{current_month}-{min(item['day_of_month'], 28):02d}"
+        conn.execute("""
+            INSERT INTO transactions
+                (user_id, group_name, category, description, amount, payment_method, date)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (user_id, item["group_name"], item["category"], item["description"],
+              item["amount"], item["payment_method"], transaction_date))
+        conn.execute("UPDATE recurring_transactions SET last_processed_month = ? WHERE id = ?",
+                     (current_month, item["id"]))
+    conn.commit()
+    conn.close()
+
+
+@app.route("/")
+@login_required
+def dashboard():
+    this_month = date.today().strftime("%Y-%m")
+    transactions = get_month_transactions(current_user.id, this_month)
+    totals, category_totals = summarize(transactions)
+    income = totals["income"]
+    expenses = totals["fixed_expense"] + totals["variable_expense"]
+    savings = totals["savings"]
+    remaining = income - expenses - savings
+    savings_rate = savings / income * 100 if income else 0
+    expense_rate = expenses / income * 100 if income else 0
+    remaining_rate = remaining / income * 100 if income else 0
+    conn = get_db()
+    recent = conn.execute(
+        "SELECT * FROM transactions WHERE user_id = ? ORDER BY date DESC, id DESC LIMIT 6",
+        (current_user.id,),
+    ).fetchall()
+    conn.close()
+    report = get_report_data(current_user.id, 6)
+    settings = get_user_settings(current_user.id)
+    budget_progress = get_budget_progress(current_user.id, this_month, int(settings["budget_alert_threshold"]))
+    biggest_category = max(category_totals, key=category_totals.get) if category_totals else None
+    return render_template(
+        "dashboard.html", income=income, expenses=expenses, savings=savings, remaining=remaining,
+        savings_rate=savings_rate, expense_rate=expense_rate, remaining_rate=remaining_rate,
+        category_totals=category_totals, recent=recent, biggest_category=biggest_category,
+        this_month=this_month, budget_progress=budget_progress,
+        trend_labels=report["trend_labels"], trend_income=report["trend_income"],
+        trend_expense=report["trend_expense"], trend_net=report["trend_net"],
+    )
+
+
+@app.route("/transactions")
+@login_required
+def transactions():
+    process_recurring_transactions(current_user.id)
+    settings = get_user_settings(current_user.id)
+    q = request.args.get("q", "").strip()
+    group = request.args.get("group", "").strip()
+    category = request.args.get("category", "").strip()
+    from_date = request.args.get("from_date", "").strip()
+    to_date = request.args.get("to_date", "").strip()
+    try:
+        page = max(1, int(request.args.get("page", 1)))
+    except ValueError:
+        page = 1
+    where = ["user_id = ?"]
+    params = [current_user.id]
+    if q:
+        where.append("(description LIKE ? OR category LIKE ?)")
+        params.extend([f"%{q}%", f"%{q}%"])
+    if group in CATEGORY_GROUPS:
+        where.append("group_name = ?")
+        params.append(group)
+    all_categories = {item for values in CATEGORY_GROUPS.values() for item in values}
+    if category in all_categories:
+        where.append("category = ?")
+        params.append(category)
+    if from_date:
+        where.append("date >= ?")
+        params.append(from_date)
+    if to_date:
+        where.append("date <= ?")
+        params.append(to_date)
+    clause = " AND ".join(where)
+    conn = get_db()
+    total = conn.execute(f"SELECT COUNT(*) FROM transactions WHERE {clause}", params).fetchone()[0]
+    per_page = 20
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page = min(page, total_pages)
+    rows = conn.execute(
+        f"SELECT * FROM transactions WHERE {clause} ORDER BY date DESC, id DESC LIMIT ? OFFSET ?",
+        params + [per_page, (page - 1) * per_page],
+    ).fetchall()
+    recurring_rows = conn.execute(
+        "SELECT * FROM recurring_transactions WHERE user_id = ? AND active = 1 ORDER BY day_of_month, id",
+        (current_user.id,),
+    ).fetchall()
+    conn.close()
+    default_group = settings["default_group"] if settings["default_group"] in CATEGORY_GROUPS else "variable_expense"
+    default_category = settings["default_category"]
+    if default_category not in CATEGORY_GROUPS[default_group]:
+        default_category = CATEGORY_GROUPS[default_group][0]
+    transaction_defaults = {
+        "group": default_group, "category": default_category,
+        "payment_method": settings["default_payment_method"],
+    }
+    return render_template(
+        "transactions.html", transactions=rows, total_transactions=total,
+        total_pages=total_pages, page=page,
+        filters={"q": q, "group": group, "category": category, "from_date": from_date, "to_date": to_date},
+        all_categories=sorted(all_categories), category_groups=CATEGORY_GROUPS,
+        group_labels=GROUP_LABELS, payment_methods=PAYMENT_METHODS,
+        income_payment_methods=INCOME_PAYMENT_METHODS, transaction_defaults=transaction_defaults,
+        recurring_transactions=recurring_rows, today=date.today().isoformat(),
+    )
+
+
+@app.route("/transactions/add", methods=["POST"])
+@login_required
+def add_transaction():
+    group_name = request.form.get("group_name", "")
+    category = request.form.get("category", "")
+    amount = parse_amount(request.form.get("amount"))
+    payment_method = request.form.get("payment_method", "")
+    t_date = request.form.get("date", "")
+    description = request.form.get("description", "").strip()[:200]
+    if not valid_transaction(group_name, category, payment_method) or not amount or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", t_date):
+        flash("Please check the transaction details and try again.")
+        return redirect(url_for("transactions"))
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO transactions (user_id, group_name, category, description, amount, payment_method, date) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (current_user.id, group_name, category, description, amount, payment_method, t_date),
+    )
+    conn.commit()
+    conn.close()
+    flash("Transaction added.")
+    return redirect(url_for("transactions"))
+
+
+@app.route("/transactions/edit/<int:transaction_id>", methods=["GET", "POST"])
+@login_required
+def edit_transaction(transaction_id):
+    conn = get_db()
+    transaction = conn.execute(
+        "SELECT * FROM transactions WHERE id = ? AND user_id = ?",
+        (transaction_id, current_user.id),
+    ).fetchone()
+    conn.close()
+    if not transaction:
+        flash("Transaction not found.")
+        return redirect(url_for("transactions"))
+    if request.method == "POST":
+        group_name = request.form.get("group_name", "")
+        category = request.form.get("category", "")
+        amount = parse_amount(request.form.get("amount"))
+        payment_method = request.form.get("payment_method", "")
+        t_date = request.form.get("date", "")
+        description = request.form.get("description", "").strip()[:200]
+        if not valid_transaction(group_name, category, payment_method) or not amount or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", t_date):
+            flash("Please check the transaction details and try again.")
+            return redirect(url_for("edit_transaction", transaction_id=transaction_id))
+        conn = get_db()
+        conn.execute("""
+            UPDATE transactions
+            SET group_name = ?, category = ?, description = ?, amount = ?, payment_method = ?, date = ?
+            WHERE id = ? AND user_id = ?
+        """, (group_name, category, description, amount, payment_method, t_date, transaction_id, current_user.id))
+        conn.commit()
+        conn.close()
+        flash("Transaction updated.")
+        return redirect(url_for("transactions"))
+    return render_template(
+        "edit_transaction.html", transaction=transaction, category_groups=CATEGORY_GROUPS,
+        group_labels=GROUP_LABELS, payment_methods=PAYMENT_METHODS,
+        income_payment_methods=INCOME_PAYMENT_METHODS,
+    )
+
+
+@app.route("/transactions/delete/<int:transaction_id>", methods=["POST"])
+@login_required
+def delete_transaction(transaction_id):
+    conn = get_db()
+    conn.execute("DELETE FROM transactions WHERE id = ? AND user_id = ?", (transaction_id, current_user.id))
+    conn.commit()
+    conn.close()
+    flash("Transaction deleted.")
+    return redirect(url_for("transactions"))
+
+
+@app.route("/transactions/recurring/add", methods=["POST"])
+@login_required
+def add_recurring_transaction():
+    group_name = request.form.get("group_name", "")
+    category = request.form.get("category", "")
+    payment_method = request.form.get("payment_method", "")
+    amount = parse_amount(request.form.get("amount"))
+    description = request.form.get("description", "").strip()[:200]
+    try:
+        day_of_month = int(request.form.get("day_of_month", 1))
+    except (TypeError, ValueError):
+        day_of_month = 0
+    if not valid_transaction(group_name, category, payment_method) or not amount or not 1 <= day_of_month <= 28:
+        flash("Please check the recurring transaction details.")
+        return redirect(url_for("transactions"))
+    conn = get_db()
+    conn.execute("""
+        INSERT INTO recurring_transactions
+            (user_id, group_name, category, description, amount, payment_method, day_of_month, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (current_user.id, group_name, category, description, amount, payment_method,
+          day_of_month, datetime.utcnow().isoformat()))
+    conn.commit()
+    conn.close()
+    flash("Recurring transaction saved.")
+    return redirect(url_for("transactions"))
+
+
+@app.route("/transactions/recurring/delete/<int:recurring_id>", methods=["POST"])
+@login_required
+def delete_recurring_transaction(recurring_id):
+    conn = get_db()
+    conn.execute("UPDATE recurring_transactions SET active = 0 WHERE id = ? AND user_id = ?",
+                 (recurring_id, current_user.id))
+    conn.commit()
+    conn.close()
+    flash("Recurring transaction removed.")
+    return redirect(url_for("transactions"))
+
+
+@app.route("/budget", methods=["GET", "POST"])
+@login_required
+def budget():
+    selected_month = request.values.get("month", date.today().strftime("%Y-%m"))
+    if not valid_month(selected_month):
+        selected_month = date.today().strftime("%Y-%m")
+    settings = get_user_settings(current_user.id)
+    threshold = int(settings["budget_alert_threshold"])
+    if request.method == "POST":
+        category = request.form.get("category", "")
+        amount = parse_amount(request.form.get("budget_amount"))
+        month = request.form.get("month", selected_month)
+        if not valid_month(month):
+            month = selected_month
+        valid_categories = CATEGORY_GROUPS["fixed_expense"] + CATEGORY_GROUPS["variable_expense"]
+        if category in valid_categories and amount:
+            conn = get_db()
+            conn.execute("""
+                INSERT INTO budgets (user_id, category, month, budget_amount)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id, category, month)
+                DO UPDATE SET budget_amount = excluded.budget_amount
+            """, (current_user.id, category, month, amount))
+            conn.commit()
+            conn.close()
+            progress = get_budget_progress(current_user.id, month, threshold)
+            item = next((row for row in progress if row["category"] == category), None)
+            if item and settings["budget_alerts"] and item["percentage"] >= threshold:
+                flash(f"{category} has reached {item['percentage']}% of its budget.")
+            else:
+                flash("Budget saved.")
+        else:
+            flash("Please choose a valid expense category and amount.")
+        return redirect(url_for("budget", month=month))
+    comparison = get_budget_progress(current_user.id, selected_month, threshold)
+    return render_template(
+        "budget.html", comparison=comparison,
+        all_expense_categories=CATEGORY_GROUPS["fixed_expense"] + CATEGORY_GROUPS["variable_expense"],
+        already_budgeted=[row["category"] for row in comparison],
+        this_month=selected_month, alert_threshold=threshold,
+        total_budget=sum(row["budget"] for row in comparison),
+        total_actual=sum(row["actual"] for row in comparison),
+        total_difference=sum(row["difference"] for row in comparison),
+    )
+
+
+@app.route("/budget/delete/<path:category>/<month>", methods=["POST"])
+@login_required
+def delete_budget(category, month):
+    conn = get_db()
+    conn.execute("DELETE FROM budgets WHERE user_id = ? AND category = ? AND month = ?",
+                 (current_user.id, category, month))
+    conn.commit()
+    conn.close()
+    flash("Budget removed.")
+    return redirect(url_for("budget", month=month if valid_month(month) else date.today().strftime("%Y-%m")))
+
+
+@app.route("/goals")
+@login_required
+def goals():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM goals WHERE user_id = ? ORDER BY id DESC", (current_user.id,)).fetchall()
+    conn.close()
+    today = date.today()
+    prepared = []
+    total_saved = total_target = 0
+    completed_count = 0
+    for row in rows:
+        goal = dict(row)
+        target = float(goal["target"])
+        saved = min(max(float(goal["saved"]), 0), target)
+        progress = min(100, saved / target * 100 if target else 0)
+        remaining = max(0, target - saved)
+        days_left = None
+        if goal.get("target_date"):
+            try:
+                days_left = (datetime.strptime(goal["target_date"], "%Y-%m-%d").date() - today).days
+            except ValueError:
+                days_left = None
+        if progress >= 100:
+            status = "completed"
+            completed_count += 1
+        elif days_left is not None and days_left < 0:
+            status = "overdue"
+        elif days_left is not None and days_left <= 30:
+            status = "due-soon"
+        else:
+            status = "in-progress"
+        monthly_needed = 0
+        if remaining and days_left is not None and days_left > 0:
+            monthly_needed = remaining / max(1, days_left / 30)
+        goal.update(saved=saved, progress=progress, remaining=remaining, days_left=days_left,
+                    status=status, monthly_needed=monthly_needed)
+        prepared.append(goal)
+        total_saved += saved
+        total_target += target
+    return render_template(
+        "goals.html", goals=prepared, total_saved=total_saved, total_target=total_target,
+        overall_progress=total_saved / total_target * 100 if total_target else 0,
+        completed_count=completed_count, today=today.isoformat(),
+    )
+
+
+@app.route("/goals/add", methods=["POST"])
+@login_required
+def add_goal():
+    name = request.form.get("name", "").strip()[:80]
+    target = parse_amount(request.form.get("target"))
+    target_date = request.form.get("target_date", "").strip() or None
+    monthly_contribution = parse_amount(request.form.get("monthly_contribution"))
+    if target_date:
+        try:
+            if datetime.strptime(target_date, "%Y-%m-%d").date() < date.today():
+                flash("Target date cannot be in the past.")
+                return redirect(url_for("goals"))
+        except ValueError:
+            flash("Please enter a valid target date.")
+            return redirect(url_for("goals"))
+    if not name or not target:
+        flash("Please enter a goal name and target amount.")
+        return redirect(url_for("goals"))
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO goals (user_id, name, target, saved, target_date, monthly_contribution) VALUES (?, ?, ?, 0, ?, ?)",
+        (current_user.id, name, target, target_date, monthly_contribution),
+    )
+    conn.commit()
+    conn.close()
+    flash("Goal created.")
+    return redirect(url_for("goals"))
+
+
+@app.route("/goals/update/<int:goal_id>", methods=["POST"])
+@login_required
+def update_goal(goal_id):
+    try:
+        saved = max(0, float(request.form.get("saved")))
+    except (TypeError, ValueError):
+        saved = 0
+    conn = get_db()
+    goal = conn.execute("SELECT target FROM goals WHERE id = ? AND user_id = ?",
+                        (goal_id, current_user.id)).fetchone()
+    if goal:
+        saved = min(saved, goal["target"])
+        conn.execute("UPDATE goals SET saved = ? WHERE id = ? AND user_id = ?",
+                     (saved, goal_id, current_user.id))
+        conn.commit()
+        flash("Goal progress updated.")
+    conn.close()
+    return redirect(url_for("goals"))
+
+
+@app.route("/goals/delete/<int:goal_id>", methods=["POST"])
+@login_required
+def delete_goal(goal_id):
+    conn = get_db()
+    conn.execute("DELETE FROM goals WHERE id = ? AND user_id = ?", (goal_id, current_user.id))
+    conn.commit()
+    conn.close()
+    flash("Goal deleted.")
+    return redirect(url_for("goals"))
+
+
+@app.route("/reports")
+@login_required
+def reports():
+    try:
+        months = int(request.args.get("months", 6))
+    except ValueError:
+        months = 6
+    months = months if months in (3, 6, 12) else 6
+    report = get_report_data(current_user.id, months)
+    return render_template(
+        "reports.html", months=months, trend_labels=report["trend_labels"],
+        trend_income=report["trend_income"], trend_expense=report["trend_expense"],
+        trend_savings=report["trend_savings"], trend_net=report["trend_net"],
+        monthly_rows=report["monthly_rows"], total_income=report["total_income"],
+        total_expenses=report["total_expenses"], total_savings=report["total_savings"],
+        total_net=report["total_net"], top_categories=report["top_categories"],
+        category_totals=report["current_category_totals"],
+    )
+
+
+@app.route("/reports/export.csv")
+@login_required
+def export_reports_csv():
+    try:
+        months = int(request.args.get("months", 6))
+    except ValueError:
+        months = 6
+    months = months if months in (3, 6, 12) else 6
+    report = get_report_data(current_user.id, months)
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Month", "Income", "Expenses", "Savings", "Net"])
+    for row in report["monthly_rows"]:
+        writer.writerow([row["month"], row["income"], row["expense"], row["savings"], row["net"]])
+    return Response(output.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": f"attachment; filename=budgetly-report-{months}m.csv"})
+
+
+@app.route("/settings")
+@login_required
+def settings():
+    return render_template(
+        "settings.html", user_settings=get_user_settings(current_user.id),
+        currencies=CURRENCY_SYMBOLS, category_groups=CATEGORY_GROUPS,
+        group_labels=GROUP_LABELS, payment_methods=PAYMENT_METHODS,
+    )
+
+
+@app.route("/settings/profile", methods=["POST"])
+@login_required
+def update_profile():
+    username = request.form.get("username", "").strip()
+    email = request.form.get("email", "").strip().lower()
+    if not username or not EMAIL_PATTERN.match(email):
+        flash("Please enter a valid username and email.")
+        return redirect(url_for("settings"))
+    conn = get_db()
+    duplicate = conn.execute(
+        "SELECT id FROM users WHERE (username = ? OR email = ?) AND id != ?",
+        (username, email, current_user.id),
+    ).fetchone()
+    if duplicate:
+        conn.close()
+        flash("That username or email is already in use.")
+        return redirect(url_for("settings"))
+    conn.execute("UPDATE users SET username = ?, email = ? WHERE id = ?",
+                 (username, email, current_user.id))
+    conn.commit()
+    conn.close()
+    current_user.username = username
+    current_user.email = email
+    flash("Profile updated.")
+    return redirect(url_for("settings"))
+
+
+@app.route("/settings/password", methods=["POST"])
+@login_required
+def change_password():
+    current_password = request.form.get("current_password", "")
+    new_password = request.form.get("new_password", "")
+    confirm_password = request.form.get("confirm_password", "")
+    conn = get_db()
+    row = conn.execute("SELECT password_hash FROM users WHERE id = ?", (current_user.id,)).fetchone()
+    if not row or not check_password_hash(row["password_hash"], current_password):
+        conn.close()
+        flash("Your current password is incorrect.")
+        return redirect(url_for("settings"))
+    errors = []
+    if new_password != confirm_password:
+        errors.append("Passwords do not match.")
+    errors.extend(validate_password(new_password, current_user.username))
+    if not errors and is_password_previously_used(conn, current_user.id, new_password):
+        errors.append("You've used that password before. Please choose a different one.")
+    if errors:
+        conn.close()
+        for error in errors:
+            flash(error)
+        return redirect(url_for("settings"))
+    new_hash = generate_password_hash(new_password)
+    conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (new_hash, current_user.id))
+    record_password(conn, current_user.id, new_hash)
+    conn.commit()
+    conn.close()
+    flash("Password updated.")
+    return redirect(url_for("settings"))
+
+
+@app.route("/settings/preferences", methods=["POST"])
+@login_required
+def update_preferences():
+    settings = get_user_settings(current_user.id)
+    currency = request.form.get("currency", "PHP")
+    default_group = request.form.get("default_group", "variable_expense")
+    default_category = request.form.get("default_category", "")
+    payment_method = request.form.get("default_payment_method", "Cash")
+    week_start = request.form.get("week_start", "monday")
+    try:
+        threshold = int(request.form.get("budget_alert_threshold", 80))
+    except ValueError:
+        threshold = 80
+    if currency not in CURRENCY_SYMBOLS:
+        currency = "PHP"
+    if default_group not in CATEGORY_GROUPS:
+        default_group = "variable_expense"
+    if default_category not in CATEGORY_GROUPS[default_group]:
+        default_category = CATEGORY_GROUPS[default_group][0]
+    if payment_method not in PAYMENT_METHODS:
+        payment_method = "Cash"
+    if week_start not in ("monday", "sunday"):
+        week_start = "monday"
+    if threshold not in (50, 80, 100):
+        threshold = 80
+    save_user_settings(current_user.id, {
+        **settings, "currency": currency, "default_group": default_group,
+        "default_category": default_category, "default_payment_method": payment_method,
+        "week_start": week_start, "budget_alert_threshold": threshold,
+        "compact_mode": bool(request.form.get("compact_mode")),
+    })
+    flash("Preferences saved.")
+    return redirect(url_for("settings"))
+
+
+@app.route("/settings/notifications", methods=["POST"])
+@login_required
+def update_notifications():
+    settings = get_user_settings(current_user.id)
+    save_user_settings(current_user.id, {
+        **settings, "budget_alerts": bool(request.form.get("budget_alerts")),
+        "weekly_summary": bool(request.form.get("weekly_summary")),
+        "goal_reminders": bool(request.form.get("goal_reminders")),
+    })
+    flash("Notification preferences saved.")
+    return redirect(url_for("settings"))
+
+
+@app.route("/settings/data/export.csv")
+@login_required
+def export_user_csv():
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT date, group_name, category, amount, payment_method, description FROM transactions WHERE user_id = ? ORDER BY date, id",
+        (current_user.id,),
+    ).fetchall()
+    conn.close()
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["date", "group_name", "category", "amount", "payment_method", "description"])
+    for row in rows:
+        writer.writerow([row["date"], row["group_name"], row["category"], row["amount"], row["payment_method"], row["description"]])
+    return Response(output.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=budgetly-transactions.csv"})
+
+
+@app.route("/settings/data/backup.json")
+@login_required
+def download_backup():
+    conn = get_db()
+    transactions = [dict(row) for row in conn.execute("SELECT * FROM transactions WHERE user_id = ?", (current_user.id,))]
+    goals = [dict(row) for row in conn.execute("SELECT * FROM goals WHERE user_id = ?", (current_user.id,))]
+    budgets = [dict(row) for row in conn.execute("SELECT * FROM budgets WHERE user_id = ?", (current_user.id,))]
+    conn.close()
+    backup = {
+        "version": 1, "exported_at": datetime.utcnow().isoformat(),
+        "profile": {"username": current_user.username, "email": current_user.email},
+        "settings": get_user_settings(current_user.id), "transactions": transactions,
+        "goals": goals, "budgets": budgets,
+    }
+    return Response(json.dumps(backup, indent=2), mimetype="application/json",
+                    headers={"Content-Disposition": "attachment; filename=budgetly-backup.json"})
+
+
+@app.route("/settings/data/import", methods=["POST"])
+@login_required
+def import_transactions():
+    uploaded = request.files.get("file")
+    if not uploaded or not uploaded.filename.lower().endswith(".csv"):
+        flash("Please choose a CSV file.")
+        return redirect(url_for("settings"))
+    try:
+        content = uploaded.stream.read().decode("utf-8-sig")
+        reader = csv.DictReader(io.StringIO(content))
+        required = {"date", "group_name", "category", "amount"}
+        if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
+            flash("CSV must include date, group_name, category, and amount columns.")
+            return redirect(url_for("settings"))
+        conn = get_db()
+        imported = skipped = 0
+        for row in reader:
+            if imported + skipped >= 5000:
+                break
+            group_name = (row.get("group_name") or "").strip()
+            category = (row.get("category") or "").strip()
+            payment_method = (row.get("payment_method") or "").strip()
+            t_date = (row.get("date") or "").strip()
+            amount = parse_amount(row.get("amount"))
+            if not valid_transaction(group_name, category, payment_method) or not amount:
+                skipped += 1
+                continue
+            try:
+                datetime.strptime(t_date, "%Y-%m-%d")
+            except ValueError:
+                skipped += 1
+                continue
+            conn.execute(
+                "INSERT INTO transactions (user_id, group_name, category, description, amount, payment_method, date) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (current_user.id, group_name, category, (row.get("description") or "").strip()[:200],
+                 amount, payment_method, t_date),
+            )
+            imported += 1
+        conn.commit()
+        conn.close()
+        flash(f"Imported {imported} transaction(s)" + (f"; skipped {skipped} invalid row(s)." if skipped else "."))
+    except UnicodeDecodeError:
+        flash("The CSV file must be UTF-8 encoded.")
+    return redirect(url_for("settings"))
+
+
+@app.route("/settings/delete-account", methods=["POST"])
+@login_required
+def delete_account():
+    password = request.form.get("password", "")
+    confirmation = request.form.get("delete_confirmation", "")
+    conn = get_db()
+    row = conn.execute("SELECT password_hash FROM users WHERE id = ?", (current_user.id,)).fetchone()
+    if confirmation != "DELETE" or not row or not check_password_hash(row["password_hash"], password):
+        conn.close()
+        flash("Account deletion requires the correct password and DELETE confirmation.")
+        return redirect(url_for("settings"))
+    conn.execute("DELETE FROM users WHERE id = ?", (current_user.id,))
+    conn.commit()
+    conn.close()
+    logout_user()
+    flash("Your account has been deleted.")
+    return redirect(url_for("login"))
+
+
+@app.errorhandler(404)
+def not_found(error):
+    return render_template("error.html", code=404, message="The page you requested could not be found."), 404
+
+
+@app.errorhandler(413)
+def too_large(error):
+    return render_template("error.html", code=413, message="That upload is too large. The limit is 2 MB."), 413
+
+
+@app.errorhandler(500)
+def server_error(error):
+    return render_template("error.html", code=500, message="Something went wrong. Please try again."), 500
+
+
+init_db()
+migrate_db()
+
+if __name__ == "__main__":
+    debug = os.environ.get("BUDGETLY_DEBUG", "0").lower() in ("1", "true", "yes")
+    app.run(debug=debug)

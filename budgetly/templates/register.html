@@ -1,0 +1,157 @@
+{% extends "base.html" %}
+{% block title %}Sign Up — Budgetly{% endblock %}
+
+{% block auth_content %}
+<main class="auth-wrap auth-register-wrap">
+    <section class="auth-card auth-card-register" aria-labelledby="signup-title">
+        <div class="auth-brand">
+            <span class="auth-logo" aria-hidden="true">◒</span>
+            <p class="auth-kicker">PERSONAL FINANCE, SIMPLIFIED</p>
+            <h1 id="signup-title">Build a calmer money routine.</h1>
+            <p class="subtitle">Create your Budgetly account in a minute.</p>
+        </div>
+
+        {% with messages = get_flashed_messages() %}
+          {% if messages %}
+            <div class="alert alert-error" role="alert">
+                <ul class="alert-list">
+                    {% for message in messages %}
+                        <li>{{ message }}</li>
+                    {% endfor %}
+                </ul>
+            </div>
+          {% endif %}
+        {% endwith %}
+
+        <form method="POST" class="auth-form" id="register-form">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <div class="auth-field-grid">
+                <label>
+                    Username
+                    <input type="text" name="username" id="username" autocomplete="username" required autofocus>
+                </label>
+                <label>
+                    Email address
+                    <input type="email" name="email" id="email" autocomplete="email" required>
+                </label>
+            </div>
+
+            <label>
+                Password
+                <span class="password-wrap">
+                    <input type="password" name="password" id="password" autocomplete="new-password" required aria-describedby="pw-requirements">
+                    <button type="button" class="toggle-password" data-password-toggle="password" aria-label="Show password" aria-pressed="false">
+                        <svg class="eye-open" xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"></path>
+                            <circle cx="12" cy="12" r="3"></circle>
+                        </svg>
+                        <svg class="eye-closed hidden" xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <path d="M17.94 17.94A10.77 10.77 0 0 1 12 19c-6.5 0-10-7-10-7a18.45 18.45 0 0 1 5.06-5.94"></path>
+                            <path d="M1 1l22 22"></path>
+                            <path d="M9.53 9.53a3.5 3.5 0 0 0 4.95 4.95"></path>
+                            <path d="M14.47 14.47A3.5 3.5 0 0 0 9.53 9.53"></path>
+                            <path d="M14.12 5.12A10.8 10.8 0 0 1 22 12s-1.27 2.54-3.88 4.88"></path>
+                        </svg>
+                    </button>
+                </span>
+            </label>
+
+            <ul class="pw-requirements" id="pw-requirements" aria-label="Password requirements" hidden>
+                <li data-rule="length">At least 8 characters</li>
+                <li data-rule="upper">At least 1 uppercase letter</li>
+                <li data-rule="lower">At least 1 lowercase letter</li>
+                <li data-rule="number">At least 1 number</li>
+                <li data-rule="special">At least 1 special character (! @ # $ % ^ &amp; *)</li>
+                <li data-rule="nospace">No spaces</li>
+                <li data-rule="nousername">Must not contain your username</li>
+                <li data-rule="match" hidden>Passwords match</li>
+            </ul>
+
+            <label>
+                Confirm password
+                <span class="password-wrap">
+                    <input type="password" name="confirm_password" id="confirm_password" autocomplete="new-password" required>
+                    <button type="button" class="toggle-password" data-password-toggle="confirm_password" aria-label="Show confirm password" aria-pressed="false">
+                        <svg class="eye-open" xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"></path>
+                            <circle cx="12" cy="12" r="3"></circle>
+                        </svg>
+                        <svg class="eye-closed hidden" xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <path d="M17.94 17.94A10.77 10.77 0 0 1 12 19c-6.5 0-10-7-10-7a18.45 18.45 0 0 1 5.06-5.94"></path>
+                            <path d="M1 1l22 22"></path>
+                            <path d="M9.53 9.53a3.5 3.5 0 0 0 4.95 4.95"></path>
+                            <path d="M14.47 14.47A3.5 3.5 0 0 0 9.53 9.53"></path>
+                            <path d="M14.12 5.12A10.8 10.8 0 0 1 22 12s-1.27 2.54-3.88 4.88"></path>
+                        </svg>
+                    </button>
+                </span>
+            </label>
+
+            <button type="submit" class="auth-submit">Create account</button>
+        </form>
+        <p class="auth-switch">Already have an account? <a href="{{ url_for('login') }}">Log in</a></p>
+    </section>
+</main>
+
+<script>
+(() => {
+    const usernameInput = document.getElementById('username');
+    const passwordInput = document.getElementById('password');
+    const confirmInput = document.getElementById('confirm_password');
+    const form = document.getElementById('register-form');
+    const requirementsList = document.getElementById('pw-requirements');
+    const matchItem = requirementsList.querySelector('[data-rule="match"]');
+    const specialChars = "!@#$%^&*";
+
+    function updateChecklist() {
+        const username = usernameInput.value.trim().toLowerCase();
+        const password = passwordInput.value;
+        const confirm = confirmInput.value;
+        const hasBothPasswords = password.length > 0 && confirm.length > 0;
+        const results = {
+            length: password.length >= 8,
+            upper: /[A-Z]/.test(password),
+            lower: /[a-z]/.test(password),
+            number: /[0-9]/.test(password),
+            special: [...password].some(character => specialChars.includes(character)),
+            nospace: password.length > 0 && !password.includes(' '),
+            nousername: password.length > 0 && (!username || !password.toLowerCase().includes(username)),
+            match: hasBothPasswords && password === confirm,
+        };
+
+        matchItem.hidden = !hasBothPasswords;
+        Object.entries(results).forEach(([rule, passed]) => {
+            const item = requirementsList.querySelector('[data-rule="' + rule + '"]');
+            item.classList.toggle('valid', passed);
+            item.classList.toggle('invalid', !passed);
+        });
+
+        requirementsList.hidden = !(password.length || confirm.length);
+        return Object.values(results).every(Boolean);
+    }
+
+    [usernameInput, passwordInput, confirmInput].forEach(input => {
+        input.addEventListener('input', updateChecklist);
+    });
+
+    document.querySelectorAll('[data-password-toggle]').forEach(button => {
+        button.addEventListener('click', () => {
+            const input = document.getElementById(button.dataset.passwordToggle);
+            const isHidden = input.type === 'password';
+            input.type = isHidden ? 'text' : 'password';
+            button.querySelector('.eye-open').classList.toggle('hidden', isHidden);
+            button.querySelector('.eye-closed').classList.toggle('hidden', !isHidden);
+            button.setAttribute('aria-label', isHidden ? 'Hide password' : 'Show password');
+            button.setAttribute('aria-pressed', String(isHidden));
+        });
+    });
+
+    form.addEventListener('submit', event => {
+        if (!updateChecklist()) {
+            requirementsList.hidden = false;
+            event.preventDefault();
+        }
+    });
+})();
+</script>
+{% endblock %}

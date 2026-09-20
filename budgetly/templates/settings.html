@@ -1,0 +1,306 @@
+{% extends "base.html" %}
+{% block title %}Settings — Budgetly{% endblock %}
+
+{% block content %}
+<div class="settings-hero">
+    <div class="settings-identity">
+        <div class="settings-avatar">{{ current_user.username[:1].upper() }}</div>
+        <div>
+            <p class="eyebrow">Account center</p>
+            <h1 class="page-title">Settings</h1>
+            <p class="page-subtitle">Personalize Budgetly, protect your account, and manage your data.</p>
+        </div>
+    </div>
+    <span class="settings-status"><span class="status-dot"></span>Account active</span>
+</div>
+
+<div class="settings-layout">
+    <div class="settings-main">
+        <section class="settings-card" id="profile">
+            <div class="settings-card-heading">
+                <div class="settings-icon purple">⌁</div>
+                <div>
+                    <h2>Profile</h2>
+                    <p>Keep your account details up to date.</p>
+                </div>
+            </div>
+            <form action="{{ url_for('update_profile') }}" method="POST" class="settings-form">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <div class="form-row">
+                    <label>
+                        Username
+                        <input type="text" name="username" value="{{ current_user.username }}" required maxlength="40">
+                    </label>
+                    <label>
+                        Email address
+                        <input type="email" name="email" value="{{ current_user.email or '' }}" required>
+                    </label>
+                </div>
+                <div class="settings-actions"><button type="submit">Save profile</button></div>
+            </form>
+        </section>
+
+        <section class="settings-card" id="security">
+            <div class="settings-card-heading">
+                <div class="settings-icon blue">⌑</div>
+                <div>
+                    <h2>Security</h2>
+                    <p>Use your current password to authorize a change.</p>
+                </div>
+            </div>
+            <form action="{{ url_for('change_password') }}" method="POST" class="settings-form">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <label>
+                    Current password
+                    <input type="password" name="current_password" autocomplete="current-password" required>
+                </label>
+                <div class="form-row">
+                    <label>
+                        New password
+                        <input type="password" name="new_password" autocomplete="new-password" required>
+                    </label>
+                    <label>
+                        Confirm new password
+                        <input type="password" name="confirm_password" autocomplete="new-password" required>
+                    </label>
+                </div>
+                <p class="form-help">Use at least 8 characters with uppercase, lowercase, a number, and a special character.</p>
+                <div class="settings-actions"><button type="submit">Update password</button></div>
+            </form>
+        </section>
+
+        <section class="settings-card" id="preferences">
+            <div class="settings-card-heading">
+                <div class="settings-icon green">✦</div>
+                <div>
+                    <h2>Budget preferences</h2>
+                    <p>Choose the defaults used when you add transactions.</p>
+                </div>
+            </div>
+            <form action="{{ url_for('update_preferences') }}" method="POST" class="settings-form">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <div class="settings-grid">
+                    <label>
+                        Currency
+                        <select name="currency">
+                            {% for code, symbol in currencies.items() %}
+                            <option value="{{ code }}" {{ 'selected' if user_settings.currency == code }}>{{ code }} ({{ symbol }})</option>
+                            {% endfor %}
+                        </select>
+                    </label>
+                    <label>
+                        Week starts on
+                        <select name="week_start">
+                            <option value="monday" {{ 'selected' if user_settings.week_start == 'monday' }}>Monday</option>
+                            <option value="sunday" {{ 'selected' if user_settings.week_start == 'sunday' }}>Sunday</option>
+                        </select>
+                    </label>
+                    <label>
+                        Default group
+                        <select name="default_group" id="settingsDefaultGroup">
+                            {% for key, label in group_labels.items() %}
+                            <option value="{{ key }}" {{ 'selected' if user_settings.default_group == key }}>{{ label }}</option>
+                            {% endfor %}
+                        </select>
+                    </label>
+                    <label>
+                        Default category
+                        <select name="default_category" id="settingsDefaultCategory"></select>
+                    </label>
+                    <label>
+                        Default payment method
+                        <select name="default_payment_method">
+                            {% for method in payment_methods %}
+                            <option value="{{ method }}" {{ 'selected' if user_settings.default_payment_method == method }}>{{ method }}</option>
+                            {% endfor %}
+                        </select>
+                    </label>
+                    <label>
+                        Budget alert threshold
+                        <select name="budget_alert_threshold">
+                            {% for threshold in (50, 80, 100) %}
+                            <option value="{{ threshold }}" {{ 'selected' if user_settings.budget_alert_threshold == threshold }}>{{ threshold }}% of budget</option>
+                            {% endfor %}
+                        </select>
+                    </label>
+                </div>
+                <label class="settings-check compact-check">
+                    <input type="checkbox" name="compact_mode" value="1" {{ 'checked' if user_settings.compact_mode }}>
+                    <span><strong>Compact layout</strong><small>Use tighter spacing to see more information at once.</small></span>
+                </label>
+                <div class="settings-actions"><button type="submit">Save preferences</button></div>
+            </form>
+        </section>
+
+        <section class="settings-card" id="notifications">
+            <div class="settings-card-heading">
+                <div class="settings-icon orange">◌</div>
+                <div>
+                    <h2>Notifications</h2>
+                    <p>Choose which reminders and summaries you want to receive.</p>
+                </div>
+            </div>
+            <form action="{{ url_for('update_notifications') }}" method="POST" class="settings-form">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <label class="settings-check">
+                    <input type="checkbox" name="budget_alerts" value="1" {{ 'checked' if user_settings.budget_alerts }}>
+                    <span><strong>Budget alerts</strong><small>Notify me when spending reaches my selected threshold.</small></span>
+                </label>
+                <label class="settings-check">
+                    <input type="checkbox" name="weekly_summary" value="1" {{ 'checked' if user_settings.weekly_summary }}>
+                    <span><strong>Weekly summary</strong><small>Receive a weekly overview of income and spending.</small></span>
+                </label>
+                <label class="settings-check">
+                    <input type="checkbox" name="goal_reminders" value="1" {{ 'checked' if user_settings.goal_reminders }}>
+                    <span><strong>Goal reminders</strong><small>Get reminders to keep your savings goals moving.</small></span>
+                </label>
+                <p class="form-help">Email delivery requires mail settings and a scheduled job configured for your deployment.</p>
+                <div class="settings-actions"><button type="submit">Save notifications</button></div>
+            </form>
+        </section>
+
+        <section class="settings-card theme-settings-card" id="theme">
+            <div class="settings-card-heading">
+                <div class="settings-icon purple">◐</div>
+                <div>
+                    <h2>Theme</h2>
+                    <p>Choose the visual mode that feels best for your focus.</p>
+                </div>
+            </div>
+            <div class="theme-options" role="radiogroup" aria-label="Choose a theme">
+                <label class="theme-option" data-theme-option="earnest">
+                    <input type="radio" name="theme" value="earnest" data-theme-choice="earnest">
+                    <span class="theme-swatch earnest-swatch" aria-hidden="true">
+                        <i></i><i></i><i></i>
+                    </span>
+                    <span class="theme-copy">
+                        <strong>Earnest &amp; Grounded</strong>
+                        <small>Warm cream, forest green, and soft gold.</small>
+                    </span>
+                </label>
+                <label class="theme-option" data-theme-option="tech">
+                    <input type="radio" name="theme" value="tech" data-theme-choice="tech">
+                    <span class="theme-swatch tech-swatch" aria-hidden="true">
+                        <i></i><i></i><i></i>
+                    </span>
+                    <span class="theme-copy">
+                        <strong>Clean Tech Trust</strong>
+                        <small>Slate white, deep navy, and electric teal.</small>
+                    </span>
+                </label>
+                <label class="theme-option" data-theme-option="original">
+                    <input type="radio" name="theme" value="original" data-theme-choice="original">
+                    <span class="theme-swatch original-swatch" aria-hidden="true">
+                        <i></i><i></i><i></i>
+                    </span>
+                    <span class="theme-copy">
+                        <strong>Original · High-Focus Dark</strong>
+                        <small>Deep charcoal, muted steel, and mint green.</small>
+                    </span>
+                </label>
+            </div>
+            <p class="form-help">Your selection applies instantly and is remembered on this browser.</p>
+        </section>
+
+        <section class="settings-card" id="data">
+            <div class="settings-card-heading">
+                <div class="settings-icon teal">↗</div>
+                <div>
+                    <h2>Data management</h2>
+                    <p>Take your information with you or import existing transactions.</p>
+                </div>
+            </div>
+            <div class="data-actions">
+                <a class="button-secondary" href="{{ url_for('export_user_csv') }}">Export transactions</a>
+                <a class="button-secondary" href="{{ url_for('download_backup') }}">Download backup</a>
+            </div>
+            <form action="{{ url_for('import_transactions') }}" method="POST" enctype="multipart/form-data" class="import-form">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <label>
+                    Import transactions from CSV
+                    <input type="file" name="file" accept=".csv,text/csv" required>
+                </label>
+                <p class="form-help">Required columns: date, group_name, category, amount. Optional: description, payment_method.</p>
+                <button type="submit">Import CSV</button>
+            </form>
+        </section>
+
+        <section class="settings-card danger-card" id="delete-account">
+            <div class="settings-card-heading">
+                <div class="settings-icon red">!</div>
+                <div>
+                    <h2>Delete account</h2>
+                    <p>This permanently removes your profile, transactions, goals, and budgets.</p>
+                </div>
+            </div>
+            <form action="{{ url_for('delete_account') }}" method="POST" class="settings-form" onsubmit="return confirm('This permanently deletes your Budgetly data. Continue?');">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <div class="form-row">
+                    <label>
+                        Current password
+                        <input type="password" name="password" autocomplete="current-password" required>
+                    </label>
+                    <label>
+                        Type DELETE to confirm
+                        <input type="text" name="delete_confirmation" placeholder="DELETE" required>
+                    </label>
+                </div>
+                <div class="settings-actions"><button type="submit" class="button-danger">Delete account</button></div>
+            </form>
+        </section>
+    </div>
+
+    <aside class="settings-sidebar">
+        <div class="settings-card settings-nav-card">
+            <p class="eyebrow">On this page</p>
+            <a href="#profile">Profile <span>→</span></a>
+            <a href="#security">Security <span>→</span></a>
+            <a href="#preferences">Preferences <span>→</span></a>
+            <a href="#notifications">Notifications <span>→</span></a>
+            <a href="#theme">Theme <span>→</span></a>
+            <a href="#data">Data management <span>→</span></a>
+        </div>
+    </aside>
+</div>
+
+<script type="application/json" id="settingsCategoryData">{{ category_groups | tojson }}</script>
+<script>
+const settingsCategoryGroups = JSON.parse(document.getElementById('settingsCategoryData').textContent);
+const settingsDefaultGroup = document.getElementById('settingsDefaultGroup');
+const settingsDefaultCategory = document.getElementById('settingsDefaultCategory');
+const savedDefaultCategory = {{ user_settings.default_category | tojson }};
+
+function updateSettingsCategories() {
+    const categories = settingsCategoryGroups[settingsDefaultGroup.value] || [];
+    settingsDefaultCategory.innerHTML = '';
+    categories.forEach(category => {
+        const option = document.createElement('option');
+        option.value = category;
+        option.textContent = category;
+        option.selected = category === savedDefaultCategory;
+        settingsDefaultCategory.appendChild(option);
+    });
+}
+settingsDefaultGroup.addEventListener('change', updateSettingsCategories);
+updateSettingsCategories();
+
+const supportedThemes = new Set(['earnest', 'tech', 'original']);
+const themeChoices = document.querySelectorAll('[data-theme-choice]');
+
+function applyTheme(theme) {
+    const selectedTheme = supportedThemes.has(theme) ? theme : 'original';
+    const html = document.documentElement;
+    html.setAttribute('data-theme', selectedTheme);
+    localStorage.setItem('budgetly-theme', selectedTheme);
+    themeChoices.forEach(choice => {
+        choice.checked = choice.value === selectedTheme;
+    });
+}
+
+const activeTheme = document.documentElement.getAttribute('data-theme') || 'original';
+applyTheme(activeTheme);
+themeChoices.forEach(choice => {
+    choice.addEventListener('change', () => applyTheme(choice.value));
+});
+</script>
+{% endblock %}

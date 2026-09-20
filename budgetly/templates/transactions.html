@@ -1,0 +1,265 @@
+{% extends "base.html" %}
+{% block title %}Transactions — Budgetly{% endblock %}
+
+{% block content %}
+<h1 class="page-title">Transactions</h1>
+
+<section class="panel">
+    <h2>Add Transaction</h2>
+    <form action="{{ url_for('add_transaction') }}" method="POST" class="tx-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <div class="form-row">
+            <label>
+                Group
+                <select name="group_name" id="group_name" required onchange="updateCategories()">
+                    <option value="" disabled>Select group</option>
+                    {% for key, label in group_labels.items() %}
+                    <option value="{{ key }}" {{ 'selected' if transaction_defaults.group == key }}>{{ label }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <label>
+                Category
+                <select name="category" id="category" required>
+                    <option value="" disabled selected>Select group first</option>
+                </select>
+            </label>
+        </div>
+        <div class="form-row">
+            <label>
+                Amount
+                <input type="number" name="amount" step="0.01" min="0.01" required>
+            </label>
+            <label>
+                Date
+                <input type="date" name="date" value="{{ today }}" required>
+            </label>
+        </div>
+        <div class="form-row">
+            <label>
+                <span id="paymentMethodLabel">Payment method</span>
+                <select name="payment_method" id="payment_method">
+                    {% for pm in payment_methods %}
+                    <option value="{{ pm }}" {{ 'selected' if transaction_defaults.payment_method == pm }}>{{ pm }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <label>
+                Description
+                <input type="text" name="description" placeholder="Optional note">
+            </label>
+        </div>
+        <button type="submit">Add Transaction</button>
+    </form>
+</section>
+
+<section class="panel">
+    <div class="panel-heading-row">
+        <div>
+            <h2>Transactions</h2>
+            <p class="panel-description">{{ total_transactions }} matching transaction(s)</p>
+        </div>
+    </div>
+    <form action="{{ url_for('transactions') }}" method="GET" class="transaction-filters">
+        <label>Search
+            <input type="search" name="q" value="{{ filters.q }}" placeholder="Description or category">
+        </label>
+        <label>Type
+            <select name="group">
+                <option value="">All types</option>
+                {% for key, label in group_labels.items() %}
+                <option value="{{ key }}" {{ 'selected' if filters.group == key }}>{{ label }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <label>Category
+            <select name="category">
+                <option value="">All categories</option>
+                {% for category in all_categories %}
+                <option value="{{ category }}" {{ 'selected' if filters.category == category }}>{{ category }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <label>From
+            <input type="date" name="from_date" value="{{ filters.from_date }}">
+        </label>
+        <label>To
+            <input type="date" name="to_date" value="{{ filters.to_date }}">
+        </label>
+        <div class="filter-actions">
+            <button type="submit">Filter</button>
+            <a class="button-secondary" href="{{ url_for('transactions') }}">Clear</a>
+        </div>
+    </form>
+    <div class="table-scroll">
+    <table class="tx-table">
+        <thead>
+            <tr>
+                <th>Date</th>
+                <th>Group</th>
+                <th>Category</th>
+                <th>Description</th>
+                <th>Amount</th>
+                <th>Payment</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for t in transactions %}
+            <tr>
+                <td>{{ t.date }}</td>
+                <td><span class="tag {{ t.group_name }}">{{ t.group_name.replace('_', ' ') }}</span></td>
+                <td>{{ t.category }}</td>
+                <td>{{ t.description or "—" }}</td>
+                <td class="amount {{ 'pos' if t.group_name == 'income' else 'neg' }}">
+                    {{ '+' if t.group_name == 'income' else '-' }}{{ currency_symbol }}{{ "{:,.0f}".format(t.amount) }}
+                </td>
+                <td>{{ t.payment_method or "—" }}</td>
+                <td>
+                    <div class="table-actions">
+                        <a href="{{ url_for('edit_transaction', transaction_id=t.id) }}">Edit</a>
+                        <form action="{{ url_for('delete_transaction', transaction_id=t.id) }}" method="POST" class="inline-form" onsubmit="return confirm('Delete this transaction?')">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                            <button type="submit" class="text-danger">Delete</button>
+                        </form>
+                    </div>
+                </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="7" class="empty">No transactions yet.</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    </div>
+    {% if total_pages > 1 %}
+    <div class="pagination">
+        {% if page > 1 %}<a href="{{ url_for('transactions', page=page-1, q=filters.q, group=filters.group, category=filters.category, from_date=filters.from_date, to_date=filters.to_date) }}">← Previous</a>{% endif %}
+        <span>Page {{ page }} of {{ total_pages }}</span>
+        {% if page < total_pages %}<a href="{{ url_for('transactions', page=page+1, q=filters.q, group=filters.group, category=filters.category, from_date=filters.from_date, to_date=filters.to_date) }}">Next →</a>{% endif %}
+    </div>
+    {% endif %}
+</section>
+
+<section class="panel">
+    <div class="panel-heading-row">
+        <div>
+            <h2>Recurring transactions</h2>
+            <p class="panel-description">These are added automatically once they become due each month.</p>
+        </div>
+    </div>
+    <form action="{{ url_for('add_recurring_transaction') }}" method="POST" class="tx-form recurring-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <div class="form-row">
+            <label>Group
+                <select name="group_name" id="recurring_group" required>
+                    {% for key, label in group_labels.items() %}
+                    <option value="{{ key }}" {{ 'selected' if key == 'fixed_expense' }}>{{ label }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <label>Category
+                <select name="category" id="recurring_category" required></select>
+            </label>
+            <label>Day of month
+                <input type="number" name="day_of_month" min="1" max="28" value="1" required>
+            </label>
+        </div>
+        <div class="form-row">
+            <label>Amount
+                <input type="number" name="amount" step="0.01" min="0.01" required>
+            </label>
+            <label><span id="recurringPaymentLabel">Payment method</span>
+                <select name="payment_method" id="recurring_payment"></select>
+            </label>
+            <label>Description
+                <input type="text" name="description" placeholder="e.g. Monthly rent">
+            </label>
+        </div>
+        <button type="submit">Save recurring transaction</button>
+    </form>
+    {% if recurring_transactions %}
+    <div class="recurring-list">
+        {% for recurring in recurring_transactions %}
+        <div class="recurring-row">
+            <div><strong>{{ recurring.category }}</strong><span>{{ recurring.description or recurring.group_name.replace('_', ' ') }} · day {{ recurring.day_of_month }}</span></div>
+            <div class="recurring-row-right"><strong>{{ currency_symbol }}{{ "{:,.2f}".format(recurring.amount) }}</strong>
+                <form action="{{ url_for('delete_recurring_transaction', recurring_id=recurring.id) }}" method="POST" class="inline-form" onsubmit="return confirm('Remove this recurring transaction?')">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <button type="submit" class="text-danger">Remove</button>
+                </form>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+    {% endif %}
+</section>
+
+<script type="application/json" id="categoryGroupsData">{{ category_groups | tojson }}</script>
+<script type="application/json" id="transactionDefaultsData">{{ transaction_defaults | tojson }}</script>
+<script type="application/json" id="paymentMethodsData">{{ {"expense": payment_methods, "income": income_payment_methods} | tojson }}</script>
+<script>
+const CATEGORY_GROUPS = JSON.parse(document.getElementById('categoryGroupsData').textContent);
+const TRANSACTION_DEFAULTS = JSON.parse(document.getElementById('transactionDefaultsData').textContent);
+const PAYMENT_METHODS = JSON.parse(document.getElementById('paymentMethodsData').textContent);
+
+function updateCategories(selectedCategory = '') {
+    const group = document.getElementById('group_name').value;
+    const categorySelect = document.getElementById('category');
+    categorySelect.innerHTML = '';
+    (CATEGORY_GROUPS[group] || []).forEach(cat => {
+        const opt = document.createElement('option');
+        opt.value = cat;
+        opt.textContent = cat;
+        opt.selected = cat === selectedCategory;
+        categorySelect.appendChild(opt);
+    });
+}
+
+updateCategories(TRANSACTION_DEFAULTS.category);
+
+function updatePaymentMethods() {
+    const group = document.getElementById('group_name').value;
+    const paymentSelect = document.getElementById('payment_method');
+    const label = document.getElementById('paymentMethodLabel');
+    const methods = group === 'income' ? PAYMENT_METHODS.income : PAYMENT_METHODS.expense;
+    const preferred = group === 'income' ? 'Cash received' : TRANSACTION_DEFAULTS.payment_method;
+    paymentSelect.innerHTML = '';
+    label.textContent = group === 'income' ? 'Money received via' : 'Payment method';
+    methods.forEach(method => {
+        const option = document.createElement('option');
+        option.value = method;
+        option.textContent = method;
+        option.selected = method === preferred;
+        paymentSelect.appendChild(option);
+    });
+}
+
+document.getElementById('group_name').addEventListener('change', updatePaymentMethods);
+updatePaymentMethods();
+
+const recurringGroup = document.getElementById('recurring_group');
+const recurringCategory = document.getElementById('recurring_category');
+const recurringPayment = document.getElementById('recurring_payment');
+function updateRecurringFields() {
+    const group = recurringGroup.value;
+    recurringCategory.innerHTML = '';
+    (CATEGORY_GROUPS[group] || []).forEach(category => {
+        const option = document.createElement('option');
+        option.value = category;
+        option.textContent = category;
+        recurringCategory.appendChild(option);
+    });
+    const methods = group === 'income' ? PAYMENT_METHODS.income : PAYMENT_METHODS.expense;
+    recurringPayment.innerHTML = '';
+    document.getElementById('recurringPaymentLabel').textContent = group === 'income' ? 'Money received via' : 'Payment method';
+    methods.forEach(method => {
+        const option = document.createElement('option');
+        option.value = method;
+        option.textContent = method;
+        recurringPayment.appendChild(option);
+    });
+}
+recurringGroup.addEventListener('change', updateRecurringFields);
+updateRecurringFields();
+</script>
+{% endblock %}

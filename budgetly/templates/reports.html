@@ -1,0 +1,157 @@
+{% extends "base.html" %}
+{% block title %}Reports — Budgetly{% endblock %}
+
+{% block content %}
+<div class="report-header">
+    <div>
+        <h1 class="page-title">Reports</h1>
+        <p class="page-subtitle">Understand where your money goes and how your balance changes over time.</p>
+    </div>
+    <a class="button-link" href="{{ url_for('export_reports_csv', months=months) }}">Download CSV</a>
+</div>
+
+<div class="report-toolbar" aria-label="Report range">
+    <span>Show:</span>
+    {% for option in (3, 6, 12) %}
+    <a href="{{ url_for('reports', months=option) }}" class="range-link {{ 'active' if months == option }}">Last {{ option }} months</a>
+    {% endfor %}
+</div>
+
+<div class="summary report-summary">
+    <div class="card income">
+        <span class="label">Income</span>
+        <span class="value">{{ currency_symbol }}{{ "{:,.2f}".format(total_income) }}</span>
+    </div>
+    <div class="card expense">
+        <span class="label">Expenses</span>
+        <span class="value">{{ currency_symbol }}{{ "{:,.2f}".format(total_expenses) }}</span>
+    </div>
+    <div class="card savings">
+        <span class="label">Savings</span>
+        <span class="value">{{ currency_symbol }}{{ "{:,.2f}".format(total_savings) }}</span>
+    </div>
+    <div class="card {{ 'income' if total_net >= 0 else 'expense' }}">
+        <span class="label">Net balance</span>
+        <span class="value">{{ '-' if total_net < 0 else '' }}{{ currency_symbol }}{{ "{:,.2f}".format(total_net | abs) }}</span>
+    </div>
+</div>
+
+<div class="dashboard-grid">
+    <section class="panel">
+        <h2>Income, expenses, and savings</h2>
+        {% if trend_labels %}
+        <div class="chart-wrap"><canvas id="trendChart"></canvas></div>
+        {% else %}
+        <p class="empty">Not enough data yet.</p>
+        {% endif %}
+    </section>
+
+    <section class="panel">
+        <h2>This month's spending by category</h2>
+        {% if category_totals %}
+        <div class="chart-wrap"><canvas id="reportCategoryChart"></canvas></div>
+        {% else %}
+        <p class="empty">No spending logged yet this month.</p>
+        {% endif %}
+    </section>
+</div>
+
+<div class="dashboard-grid">
+    <section class="panel">
+        <h2>Top spending categories</h2>
+        {% if top_categories %}
+        <div class="report-list">
+            {% for category, amount in top_categories[:5] %}
+            <div class="report-list-row">
+                <span>{{ category }}</span>
+                <strong>{{ currency_symbol }}{{ "{:,.2f}".format(amount) }}</strong>
+            </div>
+            {% endfor %}
+        </div>
+        {% else %}
+        <p class="empty">No expense data in this report range.</p>
+        {% endif %}
+    </section>
+
+    <section class="panel">
+        <h2>Monthly summary</h2>
+        {% if monthly_rows %}
+        <div class="table-scroll">
+            <table class="tx-table report-table">
+                <thead>
+                    <tr><th>Month</th><th>Income</th><th>Expenses</th><th>Net</th></tr>
+                </thead>
+                <tbody>
+                    {% for row in monthly_rows | reverse %}
+                    <tr>
+                        <td>{{ row.month }}</td>
+                        <td class="amount pos">{{ currency_symbol }}{{ "{:,.2f}".format(row.income) }}</td>
+                        <td class="amount neg">{{ currency_symbol }}{{ "{:,.2f}".format(row.expense) }}</td>
+                        <td class="amount {{ 'pos' if row.net >= 0 else 'neg' }}">{{ '-' if row.net < 0 else '' }}{{ currency_symbol }}{{ "{:,.2f}".format(row.net | abs) }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <p class="empty">No monthly data yet.</p>
+        {% endif %}
+    </section>
+</div>
+
+<script type="application/json" id="reportsData">
+{{ {
+    "trend_labels": trend_labels,
+    "trend_income": trend_income,
+    "trend_expense": trend_expense,
+    "trend_savings": trend_savings,
+    "trend_net": trend_net,
+    "category_labels": category_totals.keys() | list,
+    "category_values": category_totals.values() | list
+} | tojson }}
+</script>
+<script>
+const reportsData = JSON.parse(document.getElementById('reportsData').textContent);
+
+const trendCanvas = document.getElementById('trendChart');
+if (trendCanvas) {
+    new Chart(trendCanvas, {
+        type: 'bar',
+        data: {
+            labels: reportsData.trend_labels,
+            datasets: [
+                { label: 'Income', data: reportsData.trend_income, backgroundColor: '#10b981' },
+                { label: 'Expenses', data: reportsData.trend_expense, backgroundColor: '#ef4444' },
+                { label: 'Savings', data: reportsData.trend_savings, backgroundColor: '#3b82f6' },
+                { label: 'Net', data: reportsData.trend_net, type: 'line', borderColor: '#6366f1', backgroundColor: '#6366f1', tension: 0.25 }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { position: 'bottom' } },
+            scales: { y: { beginAtZero: true } }
+        }
+    });
+}
+
+const categoryCanvas = document.getElementById('reportCategoryChart');
+if (categoryCanvas) {
+    new Chart(categoryCanvas, {
+        type: 'pie',
+        data: {
+            labels: reportsData.category_labels,
+            datasets: [{
+                data: reportsData.category_values,
+                backgroundColor: ['#6366f1', '#ec4899', '#f59e0b', '#10b981', '#3b82f6', '#ef4444', '#8b5cf6', '#14b8a6']
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { position: 'bottom' } }
+        }
+    });
+}
+</script>
+{% endblock %}

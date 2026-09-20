@@ -1,0 +1,772 @@
+from flask import Flask, render_template, request, redirect, url_for, flash
+from flask_login import (
+    LoginManager, UserMixin, login_user, logout_user,
+    login_required, current_user
+)
+from werkzeug.security import generate_password_hash, check_password_hash
+from flask_mail import Mail, Message
+from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadSignature
+import sqlite3
+import os
+import re
+from datetime import date, datetime
+
+app = Flask(__name__)
+app.secret_key = "dev-secret-key-change-this-later"  # needed for sessions/flash messages
+DB_PATH = os.path.join(os.path.dirname(__file__), "budgetly.db")
+
+# ------------------------------------------------------------
+# EMAIL CONFIG (for password reset links)
+# ------------------------------------------------------------
+# Pulled from environment variables so real credentials never end up
+# hardcoded in source control. Set these before running the app, e.g.
+# (macOS/Linux):
+#   export MAIL_SERVER=smtp.gmail.com
+#   export MAIL_PORT=587
+#   export MAIL_USE_TLS=true
+#   export MAIL_USERNAME=youraddress@gmail.com
+#   export MAIL_PASSWORD=your-16-char-app-password   # NOT your normal password
+# (Windows PowerShell): $env:MAIL_SERVER="smtp.gmail.com"  (etc.)
+#
+# Gmail requires an "App Password" (Google Account -> Security -> 2-Step
+# Verification -> App Passwords) — your regular password will be rejected.
+# For local testing without touching a real inbox, services like
+# https://mailtrap.io offer a free sandbox SMTP server instead.
+app.config["MAIL_SERVER"] = os.environ.get("MAIL_SERVER", "smtp.gmail.com")
+app.config["MAIL_PORT"] = int(os.environ.get("MAIL_PORT", 587))
+app.config["MAIL_USE_TLS"] = os.environ.get("MAIL_USE_TLS", "true").lower() == "true"
+app.config["MAIL_USERNAME"] = os.environ.get("MAIL_USERNAME")
+app.config["MAIL_PASSWORD"] = os.environ.get("MAIL_PASSWORD")
+app.config["MAIL_DEFAULT_SENDER"] = os.environ.get("MAIL_USERNAME")
+
+mail = Mail(app)
+
+# Signs/verifies reset tokens. Uses the app's secret_key, so change that
+# secret_key in production (it currently says "change this later" — do that).
+reset_serializer = URLSafeTimedSerializer(app.secret_key)
+RESET_SALT = "password-reset-salt"
+RESET_TOKEN_MAX_AGE = 3600  # seconds = 1 hour
+
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = "login"  # redirect here if not logged in
+
+
+# ------------------------------------------------------------
+# CATEGORY DEFINITIONS
+# ------------------------------------------------------------
+CATEGORY_GROUPS = {
+    "income": ["Salary", "Freelance/Side Hustle", "Allowance", "Other Income"],
+    "fixed_expense": ["Rent", "Internet", "Phone", "Insurance", "Subscriptions", "Loans/Debt"],
+    "variable_expense": ["Food", "Transportation", "Groceries", "Entertainment", "Shopping", "Hobbies", "Miscellaneous"],
+    "savings": ["Emergency Fund", "General Savings", "Big Purchases", "Investments", "Vacation/Travel"],
+}
+GROUP_LABELS = {
+    "income": "Income",
+    "fixed_expense": "Fixed Expense",
+    "variable_expense": "Variable Expense",
+    "savings": "Savings",
+}
+PAYMENT_METHODS = ["Cash", "Debit Card", "Credit Card", "Bank Transfer", "GCash/E-wallet"]
+
+
+# ------------------------------------------------------------
+# PASSWORD RULES
+# ------------------------------------------------------------
+# Regex for allowed special characters. Kept in one place so the
+# error message and the check always agree with each other.
+SPECIAL_CHARS = ".!@#$%^&*"
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def validate_password(password, username=None):
+    """Returns a list of human-readable error strings. Empty list = valid.
+
+    Rules:
+      - at least 8 characters
+      - at least 1 uppercase letter
+      - at least 1 lowercase letter
+      - at least 1 number
+      - at least 1 special character (! @ # $ % ^ & *)
+      - cannot contain the username
+      - cannot contain spaces
+    """
+    errors = []
+
+    if len(password) < 8:
+        errors.append("Password must be at least 8 characters long.")
+    if not re.search(r"[A-Z]", password):
+        errors.append("Password must contain at least 1 uppercase letter.")
+    if not re.search(r"[a-z]", password):
+        errors.append("Password must contain at least 1 lowercase letter.")
+    if not re.search(r"[0-9]", password):
+        errors.append("Password must contain at least 1 number.")
+    if not any(ch in SPECIAL_CHARS for ch in password):
+        errors.append(f"Password must contain at least 1 special character ({' '.join(SPECIAL_CHARS)}).")
+    if " " in password:
+        errors.append("Password cannot contain spaces.")
+    if username and username.strip().lower() in password.lower():
+        errors.append("Password cannot contain your username.")
+
+    return errors
+
+
+def is_password_previously_used(conn, user_id, password):
+    """Checks a plaintext password against all hashes ever stored for this user."""
+    rows = conn.execute(
+        "SELECT password_hash FROM password_history WHERE user_id = ?",
+        (user_id,),
+    ).fetchall()
+    return any(check_password_hash(row["password_hash"], password) for row in rows)
+
+
+def record_password(conn, user_id, password_hash):
+    """Saves a hash into password_history so future changes can check against it."""
+    conn.execute(
+        "INSERT INTO password_history (user_id, password_hash, created_at) VALUES (?, ?, ?)",
+        (user_id, password_hash, datetime.utcnow().isoformat()),
+    )
+
+
+# ------------------------------------------------------------
+# PASSWORD RESET TOKENS
+# ------------------------------------------------------------
+# The token encodes the user's email PLUS their current password hash.
+# That second part is what makes the link single-use: once the password
+# is actually changed, the stored hash no longer matches what's inside
+# an old token, so replaying that link fails even though the 1-hour
+# expiry window hasn't passed yet.
+
+def generate_reset_token(email, current_password_hash):
+    return reset_serializer.dumps(
+        {"email": email, "hash": current_password_hash}, salt=RESET_SALT
+    )
+
+
+def verify_reset_token(token, max_age=RESET_TOKEN_MAX_AGE):
+    """Returns (email, hash_at_time_of_request). Raises SignatureExpired
+    or BadSignature if the token is expired/invalid — callers must catch these."""
+    data = reset_serializer.loads(token, salt=RESET_SALT, max_age=max_age)
+    return data["email"], data["hash"]
+
+
+def send_reset_email(to_email, reset_url):
+    msg = Message("Reset your Budgetly password", recipients=[to_email])
+    msg.body = (
+        "We received a request to reset your Budgetly password.\n\n"
+        f"Click the link below to choose a new one (expires in 1 hour):\n{reset_url}\n\n"
+        "If you didn't request this, you can safely ignore this email — "
+        "your password will not be changed."
+    )
+    mail.send(msg)
+
+
+# ------------------------------------------------------------
+# DATABASE HELPERS
+# ------------------------------------------------------------
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def init_db():
+    conn = get_db()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS password_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            group_name TEXT NOT NULL,       -- income / fixed_expense / variable_expense / savings
+            category TEXT NOT NULL,
+            description TEXT,
+            amount REAL NOT NULL,
+            payment_method TEXT,
+            date TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS goals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            target REAL NOT NULL,
+            saved REAL NOT NULL DEFAULT 0,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS budgets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            category TEXT NOT NULL,
+            month TEXT NOT NULL,             -- format: YYYY-MM
+            budget_amount REAL NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            UNIQUE(user_id, category, month)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def migrate_db():
+    """Adds columns/tables needed by newer versions of the app to an
+    already-existing budgetly.db, without deleting your current data.
+    Safe to run every time the app starts."""
+    conn = get_db()
+    existing_cols = [row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()]
+    if "email" not in existing_cols:
+        # Added as plain TEXT (not UNIQUE/NOT NULL) because SQLite can't add
+        # a NOT NULL/UNIQUE column to a table that already has rows.
+        # Uniqueness for email is instead enforced in the /register route.
+        conn.execute("ALTER TABLE users ADD COLUMN email TEXT")
+        conn.commit()
+    conn.close()
+
+
+# ------------------------------------------------------------
+# USER MODEL (required by Flask-Login)
+# ------------------------------------------------------------
+class User(UserMixin):
+    """Flask-Login needs an object with an .id — this wraps our DB row."""
+    def __init__(self, id, username, email=None):
+        self.id = id
+        self.username = username
+        self.email = email
+
+
+@login_manager.user_loader
+def load_user(user_id):
+    """Flask-Login calls this on every request to figure out who's
+    logged in, using the id stored in the encrypted session cookie."""
+    conn = get_db()
+    row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    conn.close()
+    if row:
+        return User(row["id"], row["username"], row["email"])
+    return None
+
+
+# ------------------------------------------------------------
+# AUTH ROUTES
+# ------------------------------------------------------------
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+
+        if not username or not email or not password:
+            flash("Please fill in all fields.")
+            return redirect(url_for("register"))
+
+        if not EMAIL_PATTERN.match(email):
+            flash("Please enter a valid email address.")
+            return redirect(url_for("register"))
+
+        password_errors = validate_password(password, username)
+        if password_errors:
+            for err in password_errors:
+                flash(err)
+            return redirect(url_for("register"))
+
+        conn = get_db()
+
+        existing_username = conn.execute(
+            "SELECT id FROM users WHERE username = ?", (username,)
+        ).fetchone()
+        if existing_username:
+            flash("That username is already taken.")
+            conn.close()
+            return redirect(url_for("register"))
+
+        existing_email = conn.execute(
+            "SELECT id FROM users WHERE email = ?", (email,)
+        ).fetchone()
+        if existing_email:
+            flash("That email is already registered.")
+            conn.close()
+            return redirect(url_for("register"))
+
+        password_hash = generate_password_hash(password)
+        cursor = conn.execute(
+            "INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)",
+            (username, email, password_hash),
+        )
+        new_user_id = cursor.lastrowid
+        record_password(conn, new_user_id, password_hash)
+
+        conn.commit()
+        conn.close()
+        flash("Account created! Please log in.")
+        return redirect(url_for("login"))
+
+    return render_template("register.html")
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+
+        conn = get_db()
+        row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        conn.close()
+
+        # check_password_hash compares the typed password against the
+        # stored hash without ever needing to know the original password.
+        if row and check_password_hash(row["password_hash"], password):
+            user = User(row["id"], row["username"], row["email"])
+            login_user(user)
+            return redirect(url_for("dashboard"))
+
+        flash("Invalid username or password.")
+        return redirect(url_for("login"))
+
+    return render_template("login.html")
+
+
+@app.route("/logout")
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for("login"))
+
+
+@app.route("/forgot-password", methods=["GET", "POST"])
+def forgot_password():
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+
+        conn = get_db()
+        row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+        conn.close()
+
+        # Send the email only if the account exists, but show the SAME
+        # message either way. If we said "no account with that email"
+        # for unknown addresses, anyone could use this form to check
+        # which emails have Budgetly accounts (email enumeration).
+        if row and row["email"]:
+            token = generate_reset_token(row["email"], row["password_hash"])
+            reset_url = url_for("reset_password", token=token, _external=True)
+            try:
+                send_reset_email(row["email"], reset_url)
+            except Exception:
+                # Common during local dev if MAIL_USERNAME/MAIL_PASSWORD
+                # aren't set yet. Don't leak the error to the user, but
+                # don't pretend it worked in the console either.
+                app.logger.exception("Failed to send password reset email")
+
+        flash("If that email is registered, we've sent a link to reset your password.")
+        return redirect(url_for("login"))
+
+    return render_template("forgot_password.html")
+
+
+@app.route("/reset-password/<token>", methods=["GET", "POST"])
+def reset_password(token):
+    try:
+        email, token_hash = verify_reset_token(token)
+    except SignatureExpired:
+        flash("That reset link has expired. Please request a new one.")
+        return redirect(url_for("forgot_password"))
+    except BadSignature:
+        flash("That reset link is invalid.")
+        return redirect(url_for("forgot_password"))
+
+    conn = get_db()
+    row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+
+    # If the password has already changed since this link was issued
+    # (either because it was already used, or changed some other way),
+    # the hash won't match anymore — treat the link as used up.
+    if not row or row["password_hash"] != token_hash:
+        conn.close()
+        flash("That reset link is invalid or has already been used.")
+        return redirect(url_for("forgot_password"))
+
+    if request.method == "POST":
+        new_password = request.form.get("password", "")
+        confirm_password = request.form.get("confirm_password", "")
+
+        if new_password != confirm_password:
+            flash("Passwords do not match.")
+            conn.close()
+            return redirect(url_for("reset_password", token=token))
+
+        password_errors = validate_password(new_password, row["username"])
+        if not password_errors and is_password_previously_used(conn, row["id"], new_password):
+            password_errors.append("You've used that password before. Please choose a different one.")
+
+        if password_errors:
+            for err in password_errors:
+                flash(err)
+            conn.close()
+            return redirect(url_for("reset_password", token=token))
+
+        new_hash = generate_password_hash(new_password)
+        conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (new_hash, row["id"]))
+        record_password(conn, row["id"], new_hash)
+        conn.commit()
+        conn.close()
+        flash("Your password has been reset. Please log in.")
+        return redirect(url_for("login"))
+
+    conn.close()
+    return render_template("reset_password.html", token=token, username=row["username"])
+
+
+# ------------------------------------------------------------
+# HELPER: monthly calculations (reused by dashboard + reports)
+# ------------------------------------------------------------
+
+def get_month_transactions(user_id, month):
+    """month format: 'YYYY-MM'. Returns all transactions in that month."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM transactions WHERE user_id = ? AND date LIKE ? ORDER BY date DESC",
+        (user_id, f"{month}%"),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def summarize(transactions):
+    """Turns a list of transaction rows into totals per group."""
+    totals = {"income": 0, "fixed_expense": 0, "variable_expense": 0, "savings": 0}
+    category_totals = {}
+    for t in transactions:
+        totals[t["group_name"]] += t["amount"]
+        if t["group_name"] != "income":
+            category_totals[t["category"]] = category_totals.get(t["category"], 0) + t["amount"]
+    return totals, category_totals
+
+
+# ------------------------------------------------------------
+# DASHBOARD
+# ------------------------------------------------------------
+
+@app.route("/")
+@login_required
+def dashboard():
+    this_month = date.today().strftime("%Y-%m")
+    transactions = get_month_transactions(current_user.id, this_month)
+    totals, category_totals = summarize(transactions)
+
+    income = totals["income"]
+    expenses = totals["fixed_expense"] + totals["variable_expense"]
+    savings = totals["savings"]
+    remaining = income - expenses - savings
+
+    savings_rate = (savings / income * 100) if income else 0
+    expense_rate = (expenses / income * 100) if income else 0
+    remaining_rate = (remaining / income * 100) if income else 0
+
+    conn = get_db()
+    recent = conn.execute(
+        "SELECT * FROM transactions WHERE user_id = ? ORDER BY date DESC, id DESC LIMIT 6",
+        (current_user.id,),
+    ).fetchall()
+    conn.close()
+
+    biggest_category = max(category_totals, key=category_totals.get) if category_totals else None
+
+    return render_template(
+        "dashboard.html",
+        income=income, expenses=expenses, savings=savings, remaining=remaining,
+        savings_rate=savings_rate, expense_rate=expense_rate, remaining_rate=remaining_rate,
+        category_totals=category_totals, recent=recent,
+        biggest_category=biggest_category,
+        this_month=this_month,
+    )
+
+
+# ------------------------------------------------------------
+# TRANSACTIONS (Income / Expenses / Savings all live here,
+# distinguished by "group_name")
+# ------------------------------------------------------------
+
+@app.route("/transactions")
+@login_required
+def transactions():
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM transactions WHERE user_id = ? ORDER BY date DESC, id DESC",
+        (current_user.id,),
+    ).fetchall()
+    conn.close()
+    return render_template(
+        "transactions.html",
+        transactions=rows,
+        category_groups=CATEGORY_GROUPS,
+        group_labels=GROUP_LABELS,
+        payment_methods=PAYMENT_METHODS,
+        today=date.today().isoformat(),
+    )
+
+
+@app.route("/transactions/add", methods=["POST"])
+@login_required
+def add_transaction():
+    group_name = request.form.get("group_name")
+    category = request.form.get("category")
+    description = request.form.get("description", "").strip()
+    amount = request.form.get("amount")
+    payment_method = request.form.get("payment_method")
+    t_date = request.form.get("date")
+
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError):
+        amount = 0
+
+    if group_name in CATEGORY_GROUPS and amount > 0 and category and t_date:
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO transactions (user_id, group_name, category, description, amount, payment_method, date) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (current_user.id, group_name, category, description, amount, payment_method, t_date),
+        )
+        conn.commit()
+        conn.close()
+
+    return redirect(url_for("transactions"))
+
+
+@app.route("/transactions/delete/<int:transaction_id>")
+@login_required
+def delete_transaction(transaction_id):
+    conn = get_db()
+    conn.execute(
+        "DELETE FROM transactions WHERE id = ? AND user_id = ?",
+        (transaction_id, current_user.id),
+    )
+    conn.commit()
+    conn.close()
+    return redirect(url_for("transactions"))
+
+
+# ------------------------------------------------------------
+# BUDGET vs ACTUAL
+# ------------------------------------------------------------
+
+@app.route("/budget", methods=["GET", "POST"])
+@login_required
+def budget():
+    this_month = date.today().strftime("%Y-%m")
+
+    if request.method == "POST":
+        category = request.form.get("category")
+        amount = request.form.get("budget_amount")
+        try:
+            amount = float(amount)
+        except (TypeError, ValueError):
+            amount = 0
+
+        if category and amount > 0:
+            conn = get_db()
+            # UPSERT: update if a budget for this category+month already
+            # exists, otherwise insert a new one.
+            conn.execute("""
+                INSERT INTO budgets (user_id, category, month, budget_amount)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id, category, month)
+                DO UPDATE SET budget_amount = excluded.budget_amount
+            """, (current_user.id, category, this_month, amount))
+            conn.commit()
+            conn.close()
+        return redirect(url_for("budget"))
+
+    conn = get_db()
+    budget_rows = conn.execute(
+        "SELECT * FROM budgets WHERE user_id = ? AND month = ?",
+        (current_user.id, this_month),
+    ).fetchall()
+    conn.close()
+
+    transactions = get_month_transactions(current_user.id, this_month)
+    _, actual_by_category = summarize(transactions)
+
+    comparison = []
+    for b in budget_rows:
+        actual = actual_by_category.get(b["category"], 0)
+        comparison.append({
+            "category": b["category"],
+            "budget": b["budget_amount"],
+            "actual": actual,
+            "difference": b["budget_amount"] - actual,
+        })
+
+    all_expense_categories = CATEGORY_GROUPS["fixed_expense"] + CATEGORY_GROUPS["variable_expense"]
+    already_budgeted = [b["category"] for b in budget_rows]
+
+    return render_template(
+        "budget.html",
+        comparison=comparison,
+        all_expense_categories=all_expense_categories,
+        already_budgeted=already_budgeted,
+        this_month=this_month,
+    )
+
+
+# ------------------------------------------------------------
+# GOALS
+# ------------------------------------------------------------
+
+@app.route("/goals")
+@login_required
+def goals():
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM goals WHERE user_id = ? ORDER BY id DESC", (current_user.id,)
+    ).fetchall()
+    conn.close()
+    return render_template("goals.html", goals=rows)
+
+
+@app.route("/goals/add", methods=["POST"])
+@login_required
+def add_goal():
+    name = request.form.get("name", "").strip()
+    target = request.form.get("target")
+    try:
+        target = float(target)
+    except (TypeError, ValueError):
+        target = 0
+
+    if name and target > 0:
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO goals (user_id, name, target, saved) VALUES (?, ?, ?, 0)",
+            (current_user.id, name, target),
+        )
+        conn.commit()
+        conn.close()
+    return redirect(url_for("goals"))
+
+
+@app.route("/goals/update/<int:goal_id>", methods=["POST"])
+@login_required
+def update_goal(goal_id):
+    saved = request.form.get("saved")
+    try:
+        saved = float(saved)
+    except (TypeError, ValueError):
+        saved = 0
+
+    conn = get_db()
+    conn.execute(
+        "UPDATE goals SET saved = ? WHERE id = ? AND user_id = ?",
+        (saved, goal_id, current_user.id),
+    )
+    conn.commit()
+    conn.close()
+    return redirect(url_for("goals"))
+
+
+@app.route("/goals/delete/<int:goal_id>")
+@login_required
+def delete_goal(goal_id):
+    conn = get_db()
+    conn.execute("DELETE FROM goals WHERE id = ? AND user_id = ?", (goal_id, current_user.id))
+    conn.commit()
+    conn.close()
+    return redirect(url_for("goals"))
+
+
+@app.route("/reports")
+@login_required
+def reports():
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM transactions WHERE user_id = ? ORDER BY date ASC",
+        (current_user.id,),
+    ).fetchall()
+    conn.close()
+
+    monthly = {}
+    for t in rows:
+        month = t["date"][:7]  # 'YYYY-MM'
+        monthly.setdefault(month, {"income": 0, "expense": 0})
+        if t["group_name"] == "income":
+            monthly[month]["income"] += t["amount"]
+        elif t["group_name"] in ("fixed_expense", "variable_expense"):
+            monthly[month]["expense"] += t["amount"]
+
+    months_sorted = sorted(monthly.keys())[-6:]
+    trend_labels = months_sorted
+    trend_income = [monthly[m]["income"] for m in months_sorted]
+    trend_expense = [monthly[m]["expense"] for m in months_sorted]
+
+    this_month = date.today().strftime("%Y-%m")
+    this_month_tx = get_month_transactions(current_user.id, this_month)
+    _, category_totals = summarize(this_month_tx)
+
+    return render_template(
+        "reports.html",
+        trend_labels=trend_labels,
+        trend_income=trend_income,
+        trend_expense=trend_expense,
+        category_totals=category_totals,
+    )
+
+
+@app.route("/settings", methods=["GET", "POST"])
+@login_required
+def settings():
+    if request.method == "POST":
+        new_password = request.form.get("new_password", "")
+        if new_password:
+            password_errors = validate_password(new_password, current_user.username)
+
+            conn = get_db()
+            if not password_errors and is_password_previously_used(conn, current_user.id, new_password):
+                password_errors.append("You've used that password before. Please choose a different one.")
+
+            if password_errors:
+                for err in password_errors:
+                    flash(err)
+                conn.close()
+                return redirect(url_for("settings"))
+
+            new_hash = generate_password_hash(new_password)
+            conn.execute(
+                "UPDATE users SET password_hash = ? WHERE id = ?",
+                (new_hash, current_user.id),
+            )
+            record_password(conn, current_user.id, new_hash)
+            conn.commit()
+            conn.close()
+            flash("Password updated.")
+        return redirect(url_for("settings"))
+
+    return render_template("settings.html")
+
+
+if __name__ == "__main__":
+    init_db()
+    migrate_db()
+    app.run(debug=True)
